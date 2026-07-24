@@ -1,0 +1,14 @@
+streamlit
+pandas
+openpyxl
+openai==0.28.0
+tqdm
+scikit-learn
+unidecode
+nltk
+joblib
+bertopic
+xgboost==2.0.3
+selenium>=4.15.0
+requests
+beautifulsoup4
