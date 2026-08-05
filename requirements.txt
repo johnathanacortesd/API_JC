@@ -12,3 +12,4 @@ xgboost==2.0.3
 selenium>=4.15.0
 requests
 beautifulsoup4
+starlette<0.40.0
