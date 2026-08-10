@@ -20,9 +20,7 @@ from sklearn.cluster import AgglomerativeClustering
 import json
 import asyncio
 import hashlib
-from typing import List, Dict, Tuple, Optional, Any, Callable, Sequence
-from dataclasses import dataclass, field
-import random
+from typing import List, Dict, Tuple, Optional, Any
 import joblib
 import gc
 import requests
@@ -31,33 +29,6 @@ import zipfile
 import xml.etree.ElementTree as ET
 import html
 from pathlib import Path
-
-# ── Errores reintentables de OpenAI (openai==0.28) ───────────────────────────
-# Distinguir un fallo de red de una respuesta vacía evita que un 429 se
-# convierta silenciosamente en "Neutro".
-try:  # openai==0.28
-    from openai.error import (
-        APIConnectionError,
-        APIError,
-        RateLimitError,
-        ServiceUnavailableError,
-        Timeout,
-    )
-
-    _ERRORES_REINTENTABLES: Tuple[type, ...] = (
-        RateLimitError,
-        APIError,
-        Timeout,
-        ServiceUnavailableError,
-        APIConnectionError,
-    )
-    _ERROR_RATE_LIMIT: Tuple[type, ...] = (RateLimitError,)
-except Exception:  # pragma: no cover
-    _ERRORES_REINTENTABLES = (Exception,)
-    _ERROR_RATE_LIMIT = ()
-
-MODELO_CLASIFICACION_POR_DEFECTO = "gpt-4.1-nano-2025-04-14"
-MOTOR_PRECISION_DISPONIBLE = True
 
 # ======================================
 # Configuración general
@@ -72,7 +43,7 @@ st.set_page_config(
 OPENAI_MODEL_EMBEDDING     = "text-embedding-3-small"
 OPENAI_MODEL_CLASIFICACION = "gpt-4.1-nano-2025-04-14"
 
-CONCURRENT_REQUESTS          = 24   # Alineado con el motor de precisión: evita 429 y resultados truncados.
+CONCURRENT_REQUESTS          = 50
 SIMILARITY_THRESHOLD_TONO    = 0.96  # El tono solo se hereda entre republicaciones casi idénticas.
 SIMILARITY_THRESHOLD_TITULOS = 0.94
 
@@ -101,10 +72,6 @@ SIM_MINIMA_FUSION_INTER       = 0.90
 PRICE_INPUT_1M     = 0.10
 PRICE_OUTPUT_1M    = 0.40
 PRICE_EMBEDDING_1M = 0.02
-
-# ── Motor de precisión ───────────────────────────────────────────────────────
-# Cambiar a False para volver al pipeline clásico sin tocar nada más.
-USAR_MOTOR_PRECISION = True
 
 if 'tokens_input' not in st.session_state: st.session_state['tokens_input']     = 0
 if 'tokens_output' not in st.session_state: st.session_state['tokens_output']    = 0
@@ -205,7 +172,7 @@ _TILDE_MAP = {
     "movil":"móvil","moviles":"móviles","codigo":"código","informatica":"informática",
     "electronica":"electrónica","robotica":"robótica","ciberseguridad":"ciberseguridad",
     "trafico":"tráfico","transito":"tránsito","aereo":"aéreo","maritimo":"marítimo",
-    "turistica":"turística","turistico":"turístico","gastronomia":"gastronomía",
+    "turistica":"turística","turistico":"turístico","gastronomia":"gastrónomía",
     "academica":"académica","academico":"académico","pedagogica":"pedagógica",
     "cientifica":"científica","cientifico":"científico","juridica":"jurídica",
     "juridico":"jurídico","constitucion":"constitución","resolucion":"resolución",
@@ -228,15 +195,15 @@ _ENIE_MAP = {
     "danino":"dañino","danina":"dañina","montana":"montaña","montanas":"montañas",
     "espana":"España","espanol":"español","espanola":"española","espanoles":"españoles",
     "companero":"compañero","companera":"compañera","companeros":"compañeros","companeras":"compañeras",
-    "compania":"compañía","companias":"compañías","acompanamiento":"acompañamiento",
-    "banio":"baño","banios":"baños","bano":"baño","banos":"baños",
-    "penon":"peñón","senor":"señor","senora":"señora",
+    "compania":"compañía","companias":"compañías","acompanamiento":"acompanamiento",
+    "cana":"caña","canas":"cañas","banio":"baño","banios":"baños","bano":"baño","banos":"baños",
+    "pena":"peña","penas":"peñas","penon":"peñón","senor":"señor","senora":"señora",
     "senores":"señores","senoras":"señoras","senal":"señal","senales":"señales",
     "senalizacion":"señalización","pequeno":"pequeño","pequena":"pequeña",
-    "pequenos":"pequeños","pequenas":"pequeñas","sueno":"sueño","suenos":"sueños",
+    "pequenos":"pequeños","pequenas":"peñas","sueno":"sueño","suenos":"sueños",
     "dueno":"dueño","duena":"dueña","duenos":"dueños","duenas":"dueñas",
     "otono":"otoño","punio":"puño","punios":"puños","puno":"puño",
-    "canones":"cañones","manana":"mañana","mananas":"mañanas",
+    "canon":"cañón","canones":"cañones","manana":"mañana","mananas":"mañanas",
     "cabana":"cabaña","cabanas":"cabañas","banera":"bañera","vinedo":"viñedo",
     "vinedos":"viñedos","rebano":"rebaño","rebanos":"rebaños","extrano":"extraño",
     "extrana":"extraña","extranos":"extraños","extranas":"extrañas",
@@ -1139,22 +1106,16 @@ def get_embeddings_batch(textos, batch_size=100):
                 emb = d["embedding"]
                 resultados[oi] = emb
                 cache.put(textos[oi], emb)
-        except Exception:
-            # El lote falló: se reintenta ítem por ítem para no perder todo el bloque.
-            st.session_state['embeddings_lotes_fallidos'] = st.session_state.get('embeddings_lotes_fallidos', 0) + 1
+        except:
             for j, t in enumerate(batch):
                 oi = bidx[j]
                 try:
-                    r = call_with_retries(openai.Embedding.create, input=[t], model=OPENAI_MODEL_EMBEDDING)
+                    r = openai.Embedding.create(input=[t], model=OPENAI_MODEL_EMBEDDING)
                     emb = r["data"][0]["embedding"]
                     resultados[oi] = emb
                     cache.put(textos[oi], emb)
-                except Exception as e_item:
-                    # Sin embedding esta nota no puede agruparse: se registra en lugar de silenciarse.
-                    st.session_state['embeddings_fallidos'] = st.session_state.get('embeddings_fallidos', 0) + 1
-                    st.session_state.setdefault('embeddings_errores', [])
-                    if len(st.session_state['embeddings_errores']) < 5:
-                        st.session_state['embeddings_errores'].append(f"{type(e_item).__name__}: {e_item}")
+                except:
+                    pass
     return resultados
 
 class DSU:
@@ -1211,6 +1172,68 @@ def agrupar_por_titulo_similar(titulos):
             grupos[gid] = list(set(grp))
             gid += 1
     return grupos
+
+
+def construir_story_clusters(textos, titulos=None, urls=None, umbral=0.90):
+    """Construye una identidad única de acontecimiento para todo el lote.
+
+    Se usa como capa común para tono, tema y subtema. El criterio combina URL,
+    similitud de titular, similitud semántica y coincidencia de términos
+    distintivos; las acciones opuestas nunca se fusionan.
+    """
+    textos = [str(x or "") for x in textos]
+    titulos = [str(x or "") for x in (titulos or [""] * len(textos))]
+    urls = [str(x or "") for x in (urls or [""] * len(textos))]
+    n = len(textos)
+    dsu = DSU(n)
+    norm_titles = [normalize_title_for_comparison(x) for x in titulos]
+    norm_urls = [_normalizar_url(x) for x in urls]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if norm_urls[i] and norm_urls[i] == norm_urls[j]:
+                dsu.union(i, j)
+                continue
+            title_sim = SequenceMatcher(None, norm_titles[i], norm_titles[j]).ratio() if norm_titles[i] and norm_titles[j] else 0
+            overlap = _overlap_distintivo(f"{titulos[i]} {textos[i]}", f"{titulos[j]} {textos[j]}")
+            if _hay_conflicto_accion(f"{titulos[i]} {textos[i]}", f"{titulos[j]} {textos[j]}"):
+                continue
+            if title_sim >= 0.94 and overlap >= 0.35:
+                dsu.union(i, j)
+    embs = get_embeddings_batch([texto_para_embedding(titulos[i], textos[i]) for i in range(n)])
+    valid = [(i, e) for i, e in enumerate(embs) if e is not None]
+    if len(valid) >= 2:
+        for pos, (i, ei) in enumerate(valid):
+            for j, ej in valid[pos + 1:]:
+                if dsu.find(i) == dsu.find(j):
+                    continue
+                sim = cosine_similarity(np.array(ei).reshape(1, -1), np.array(ej).reshape(1, -1))[0][0]
+                overlap = _overlap_distintivo(f"{titulos[i]} {textos[i]}", f"{titulos[j]} {textos[j]}")
+                if sim >= umbral and overlap >= 0.18 and not _hay_conflicto_accion(
+                    f"{titulos[i]} {textos[i]}", f"{titulos[j]} {textos[j]}"
+                ):
+                    dsu.union(i, j)
+    groups = dsu.grupos(n)
+    ids = {}
+    for seq, idxs in enumerate(sorted(groups.values(), key=lambda g: min(g)), start=1):
+        sid = f"ST-{seq:05d}"
+        for i in idxs:
+            ids[i] = sid
+    return [ids.get(i, f"ST-{i + 1:05d}") for i in range(n)]
+
+
+def unificar_valores_por_historia(valores, story_clusters):
+    """Garantiza una única clasificación canónica dentro de cada historia."""
+    if not story_clusters or len(valores) != len(story_clusters):
+        return list(valores)
+    por_story = defaultdict(list)
+    for sid, valor in zip(story_clusters, valores):
+        if valor not in (None, "", "Varios", "Sin tema", "N/A"):
+            por_story[sid].append(valor)
+    canon = {
+        sid: Counter(vals).most_common(1)[0][0]
+        for sid, vals in por_story.items() if vals
+    }
+    return [canon.get(sid, valor) for sid, valor in zip(story_clusters, valores)]
 
 def seleccionar_representante(indices, textos):
     embs = get_embeddings_batch([textos[i] for i in indices])
@@ -1283,7 +1306,7 @@ class ClasificadorTono:
             except Exception as e:
                 return {"tono": "Neutro"}
 
-    async def procesar_lote_async(self, textos, pbar, resumenes, titulos):
+    async def procesar_lote_async(self, textos, pbar, resumenes, titulos, story_clusters=None):
         n = len(textos)
         txts = textos.tolist()
         pbar.progress(0.05, "Agrupando noticias para análisis de tono...")
@@ -1292,8 +1315,12 @@ class ClasificadorTono:
         dsu = DSU(n)
         
         embs = get_embeddings_batch(txts_emb)
-        candidatos = agrupar_textos_similares(txts_emb, SIMILARITY_THRESHOLD_TONO)
-        candidatos.update({len(candidatos) + k: v for k, v in agrupar_por_titulo_similar(titulos.tolist()).items()})
+        candidatos = defaultdict(list)
+        if story_clusters:
+            for i, sid in enumerate(story_clusters): candidatos[sid].append(i)
+        else:
+            candidatos.update(agrupar_textos_similares(txts_emb, SIMILARITY_THRESHOLD_TONO))
+            candidatos.update({len(candidatos) + k: v for k, v in agrupar_por_titulo_similar(titulos.tolist()).items()})
         for idxs in candidatos.values():
             for pos, i in enumerate(idxs):
                 for j in idxs[pos + 1:]:
@@ -1304,7 +1331,7 @@ class ClasificadorTono:
                         and cosine_similarity(np.array(embs[i]).reshape(1, -1), np.array(embs[j]).reshape(1, -1))[0][0] >= SIMILARITY_THRESHOLD_TONO
                         and _overlap_distintivo(txts_emb[i], txts_emb[j]) >= 0.45
                     )
-                    if (titulo_casi_igual or contenido_casi_igual) and not _hay_conflicto_accion(txts_emb[i], txts_emb[j]):
+                    if story_clusters or ((titulo_casi_igual or contenido_casi_igual) and not _hay_conflicto_accion(txts_emb[i], txts_emb[j])):
                         dsu.union(i, j)
                 
         grupos = dsu.grupos(n)
@@ -1803,7 +1830,7 @@ class ClasificadorSubtema:
         except:
             return {s: s for s in subtemas_unicos}
 
-    def procesar_lote(self, col, pbar, res_puros, tit_puros):
+    def procesar_lote(self, col, pbar, res_puros, tit_puros, story_clusters=None):
         textos   = col.tolist()
         titulos  = tit_puros.tolist()
         resumenes = res_puros.tolist()
@@ -1820,6 +1847,11 @@ class ClasificadorSubtema:
 
         pbar.progress(0.05, "Fase 1 · Idénticas...")
         dsu = DSU(n)
+        if story_clusters:
+            by_story = defaultdict(list)
+            for i, sid in enumerate(story_clusters): by_story[sid].append(i)
+            for idxs in by_story.values():
+                for j in idxs[1:]: dsu.union(idxs[0], j)
         self._paso1(titulos, resumenes, dsu)
         
         pbar.progress(0.12, "Fase 2 · Títulos...")
@@ -2569,7 +2601,7 @@ def generate_output_excel(rows, km):
         "ID Noticia", "Fecha", "Hora", "Medio", "Tipo de Medio",
         "Sección - Programa", "Región", "Título", "Autor - Conductor",
         "Nro. Pagina", "Dimensión", "Duración - Nro. Caracteres",
-        "CPE", "Tier", "Audiencia", "Tono", "Tono IA", "Tema", "Subtema",
+        "CPE", "Tier", "Audiencia", "Tono", "Tono IA", "Tema", "Subtema", "ID Historia",
         "Link Nota", "Resumen - Aclaracion", "Link (Streaming - Imagen)", "Menciones - Empresa",
         "ID duplicada",
         "Cuerpo Completo"   # ── ADICIÓN: columna final con el CuerpoEs completo, sin truncar ──
@@ -2658,2298 +2690,11 @@ def generate_output_excel(rows, km):
     return buf.getvalue()
 
 
-# ==============================================================================
-# ==============================================================================
-#   MOTOR DE PRECISIÓN  ·  jerarquía identidad -> asunto -> tema
-# ==============================================================================
-#  Reemplaza el nucleo analitico (tono, subtema y tema) por una arquitectura de
-#  TRES NIVELES calculada UNA sola vez y compartida por las tres salidas:
-#
-#     NIVEL 0 · IDENTIDAD  "es la misma noticia" (republicacion / teletipo)
-#                          -> comparte OBLIGATORIAMENTE tono + tema + subtema
-#     NIVEL 1 · ASUNTO     "distintas noticias sobre el mismo hecho"
-#                          -> comparte tema + subtema
-#     NIVEL 2 · TEMA       "asuntos afines bajo una categoria editorial"
-#                          -> comparte tema
-#
-#  Antes cada salida construia su propia agrupacion (el tono un DSU, el subtema
-#  otro, el tema un clustering aparte), de modo que dos noticias podian quedar
-#  unidas para el tono y separadas para el subtema. Aqui el grafo se calcula una
-#  vez y se propaga.
-#
-#  Principio rector: PRECISION SOBRE COBERTURA. Ante la duda NO se agrupa y NO
-#  se asigna tono distinto de Neutro. Toda union exige coincidencia en dos
-#  familias de senales independientes (semantica + lexica/entidades).
-#
-#  Modelo de clasificacion: gpt-4.1-nano-2025-04-14 (sin cambios).
-#  Sin dependencias nuevas: numpy, scikit-learn, unidecode y openai ya estaban.
-# ==============================================================================
-
-MODELO_CLASIFICACION_POR_DEFECTO = "gpt-4.1-nano-2025-04-14"
-
-
-# ==============================================================================
-# 1 · CONFIGURACIÓN
-# ==============================================================================
-
-@dataclass
-class ConfigPrecision:
-    """Umbrales del motor. Todos calibrados hacia la precisión.
-
-    Los tres umbrales de similitud coseno (`identidad`, `asunto`, `tema`) operan
-    sobre `text-embedding-3-small`, donde dos textos sin relación real rara vez
-    bajan de 0.60. Por eso los pisos absolutos son altos: 0.80 en ese espacio NO
-    significa "parecido", significa "vagamente del mismo campo semántico".
-    """
-
-    # ── Nivel 0 · identidad (misma noticia) ────────────────────────────────
-    sim_identidad: float = 0.945
-    sim_republicacion: float = 0.975      # copia casi literal: basta con esto
-    ratio_titulo_identico: float = 0.93
-
-    # ── Nivel 1 · asunto (subtema) ─────────────────────────────────────────
-    sim_asunto: float = 0.880
-    piso_absoluto_asunto: float = 0.855   # por debajo NUNCA se agrupa
-
-    # ── Nivel 2 · tema ─────────────────────────────────────────────────────
-    sim_tema: float = 0.800
-    piso_absoluto_tema: float = 0.760
-
-    # ── Señales léxicas exigidas además del embedding ──────────────────────
-    jaccard_entidades_min: float = 0.30   # entidades fuertes compartidas
-    overlap_tokens_min: float = 0.42      # tokens distintivos compartidos
-    overlap_tokens_min_tema: float = 0.22
-
-    # ── Entidades: filtro IDF ──────────────────────────────────────────────
-    # Una entidad presente en más del X% del corpus no discrimina nada
-    # ("Colombia", "Gobierno", "Bogotá") y se descarta como señal.
-    df_max_entidad_fuerte: float = 0.15
-    min_entidades_para_exigir: int = 2
-
-    # ── Tono ───────────────────────────────────────────────────────────────
-    confianza_minima_tono: float = 0.70   # por debajo -> segunda pasada
-    revisar_grupos_grandes: int = 4       # grupos >= N notas -> siempre revisar
-
-    # ── Etiquetas ──────────────────────────────────────────────────────────
-    min_palabras_subtema: int = 3
-    max_palabras_subtema: int = 7
-    min_palabras_tema: int = 2
-    max_palabras_tema: int = 4
-    max_notas_por_etiqueta: int = 40
-    vecinos_vocabulario: int = 8          # etiquetas previas que ve el modelo
-    sim_unificar_etiquetas: float = 0.90  # dos etiquetas se estudian como sinónimas
-    # Prueba de especificidad: la etiqueta debe describir SU grupo mejor de lo que
-    # describe al corpus entero. Si no gana por este margen, es una generalidad.
-    margen_especificidad: float = 0.03
-
-    # ── Recursos ───────────────────────────────────────────────────────────
-    max_pares_por_item: int = 30
-    n_max_matriz_completa: int = 2500
-
-    def escalar_por_corpus(self, n: int) -> "ConfigPrecision":
-        """Endurece los umbrales en corpus pequeños.
-
-        Con 5 noticias no hay evidencia estadística para agrupar nada: cualquier
-        fusión errónea se lleva el 20% del informe. Con 500, el clustering tiene
-        contexto suficiente y puede relajarse ligeramente.
-        """
-        c = ConfigPrecision(**self.__dict__)
-        if n <= 5:
-            c.sim_asunto, c.piso_absoluto_asunto = 0.930, 0.910
-            c.sim_tema, c.piso_absoluto_tema = 0.880, 0.850
-            c.overlap_tokens_min = 0.55
-            c.jaccard_entidades_min = 0.40
-        elif n <= 12:
-            c.sim_asunto, c.piso_absoluto_asunto = 0.905, 0.880
-            c.sim_tema, c.piso_absoluto_tema = 0.845, 0.810
-            c.overlap_tokens_min = 0.50
-            c.jaccard_entidades_min = 0.35
-        elif n <= 30:
-            c.sim_asunto, c.piso_absoluto_asunto = 0.892, 0.868
-            c.sim_tema, c.piso_absoluto_tema = 0.820, 0.785
-            c.overlap_tokens_min = 0.46
-        return c
-
-
-@dataclass
-class Telemetria:
-    """Contadores de calidad.
-
-    Sin esto no se puede afirmar que el sistema "mejoró": los `except:` mudos
-    del código original convertían cualquier fallo de API en un "Neutro" o en un
-    subtema genérico, indistinguibles de una clasificación real.
-    """
-
-    llamadas_ok: int = 0
-    llamadas_json_invalido: int = 0
-    llamadas_error: int = 0
-    llamadas_rate_limit: int = 0
-    tokens_in: int = 0
-    tokens_out: int = 0
-
-    tono_sin_mencion: int = 0
-    tono_revisado: int = 0
-    tono_cambiado_en_revision: int = 0
-    tono_forzado_neutro_por_afectado: int = 0
-    tono_baja_confianza_final: int = 0
-    tono_armonizado_por_asunto: int = 0
-
-    uniones_identidad: int = 0
-    uniones_asunto: int = 0
-    uniones_rechazadas_entidades: int = 0
-    uniones_rechazadas_overlap: int = 0
-    uniones_rechazadas_conflicto: int = 0
-
-    etiquetas_llm: int = 0
-    etiquetas_fallback: int = 0
-    etiquetas_unificadas: int = 0
-    etiquetas_reformuladas_genericas: int = 0
-    subtemas_reasignados_coherencia: int = 0
-
-    avisos: List[str] = field(default_factory=list)
-
-    def avisar(self, msg: str) -> None:
-        if msg not in self.avisos:
-            self.avisos.append(msg)
-
-    @property
-    def tasa_fallo_llm(self) -> float:
-        total = self.llamadas_ok + self.llamadas_error + self.llamadas_json_invalido
-        return 0.0 if total == 0 else (self.llamadas_error + self.llamadas_json_invalido) / total
-
-    def resumen(self) -> Dict[str, Any]:
-        return {
-            "LLM · llamadas correctas": self.llamadas_ok,
-            "LLM · JSON inválido": self.llamadas_json_invalido,
-            "LLM · errores de API": self.llamadas_error,
-            "LLM · rate limits": self.llamadas_rate_limit,
-            "LLM · tasa de fallo": f"{self.tasa_fallo_llm * 100:.1f}%",
-            "Tono · sin mención de marca": self.tono_sin_mencion,
-            "Tono · revisados 2ª pasada": self.tono_revisado,
-            "Tono · corregidos en revisión": self.tono_cambiado_en_revision,
-            "Tono · forzados a Neutro": self.tono_forzado_neutro_por_afectado,
-            "Tono · baja confianza final": self.tono_baja_confianza_final,
-            "Tono · unificados por asunto": self.tono_armonizado_por_asunto,
-            "Grupos · uniones identidad": self.uniones_identidad,
-            "Grupos · uniones asunto": self.uniones_asunto,
-            "Grupos · rechazos por entidades": self.uniones_rechazadas_entidades,
-            "Grupos · rechazos por overlap": self.uniones_rechazadas_overlap,
-            "Grupos · rechazos por acción opuesta": self.uniones_rechazadas_conflicto,
-            "Etiquetas · generadas por LLM": self.etiquetas_llm,
-            "Etiquetas · por fallback": self.etiquetas_fallback,
-            "Etiquetas · unificadas": self.etiquetas_unificadas,
-            "Etiquetas · reformuladas por genéricas": self.etiquetas_reformuladas_genericas,
-            "Subtemas · reasignados por coherencia": self.subtemas_reasignados_coherencia,
-        }
-
-
-@dataclass
-class EngineContext:
-    """Dependencias externas inyectadas (evita acoplar el motor a Streamlit)."""
-
-    embed: Callable[[List[str]], List[Optional[List[float]]]]
-    modelo: str = MODELO_CLASIFICACION_POR_DEFECTO
-    on_tokens: Optional[Callable[[int, int], None]] = None
-    # 50 concurrentes contra un modelo nano provoca 429s; cada 429 agotado se
-    # convertía en un "Neutro" silencioso. 24 sostiene el throughput sin ese sesgo.
-    max_concurrencia: int = 24
-    seed: int = 7
-    tel: Telemetria = field(default_factory=Telemetria)
-
-
-@dataclass
-class ResultadoAnalisis:
-    tonos: List[str]
-    confianza_tono: List[float]
-    subtemas: List[str]
-    temas: List[str]
-    id_identidad: List[int]
-    id_asunto: List[int]
-    telemetria: Telemetria
-
-
-# ==============================================================================
-# 2 · NORMALIZACIÓN LÉXICA
-# ==============================================================================
-
-_PE_STOPWORDS = set(
-    """
-a ante bajo cabe con contra de desde durante en entre hacia hasta mediante para
-por segun sin so sobre tras y o u e la el los las un una unos unas lo al del se
-su sus le les mi mis tu tus nuestro nuestros vuestra vuestras este esta estos
-estas ese esa esos esas aquel aquella aquellos aquellas que cual cuales quien
-quienes cuyo cuya cuyos cuyas como cuando donde es son fue fueron era eran sera
-seran seria serian he ha han habia hay hubo habra habria estoy estan estaba
-estaban estamos estar estare estaria estuvieron estarian estuvo asi ya mas menos
-tan tanto cada muy todo toda todos todas ser haber hacer tener poder deber ir
-dar ver saber querer llegar pasar encontrar creer decir poner salir volver
-seguir llevar sentir cambiar tambien pero aunque mientras segun ademas
-""".split()
-)
-
-# Términos que aparecen en cualquier noticia y por tanto no distinguen una de
-# otra. Sin este filtro, dos notas sin nada en común comparten "empresa",
-# "gobierno" y "sector" y superan el test de overlap.
-TOKENS_DEBILES = _PE_STOPWORDS | {
-    "noticia", "noticias", "informe", "informacion", "comunicado", "anuncio",
-    "colombia", "pais", "nacional", "regional", "local", "sector", "sectores",
-    "empresa", "empresas", "entidad", "entidades", "autoridad", "autoridades",
-    "gobierno", "alcaldia", "gobernacion", "ministerio", "nuevo", "nueva",
-    "nuevos", "nuevas", "plan", "programa", "proyecto", "iniciativa",
-    "actividad", "actividades", "gestion", "tema", "caso", "casos", "millones",
-    "personas", "durante", "medio", "medios", "mercado", "grupo", "cifras",
-    "aumento", "informo", "explico", "agrego", "senalo", "afirmo", "dijo",
-}
-
-PALABRAS_CORTE_ETIQUETA = {
-    "de", "del", "la", "el", "los", "las", "un", "una", "unos", "unas", "al",
-    "su", "sus", "en", "con", "sin", "por", "para", "sobre", "ante", "bajo",
-    "contra", "desde", "entre", "hacia", "hasta", "mediante", "tras", "y", "o",
-    "u", "e", "lo", "que", "se", "como", "donde", "cuando", "cual", "cuyo",
-    "cuya", "cuyos", "cuyas", "este", "esta", "estos", "estas", "ese", "esa",
-    "esos", "esas", "aquel", "aquella", "aquellos", "aquellas", "cada", "todo",
-    "toda", "todos", "todas", "otro", "otra", "otros", "otras", "nuevo",
-    "nueva", "nuevos", "nuevas", "gran", "grandes", "mayor", "mayores",
-    "menor", "menores", "mejor", "mejores", "peor", "peores", "primer",
-    "primera", "segundo", "segunda", "tercer", "tercera", "mas", "muy", "tan",
-    "tanto", "tanta", "tantos", "tantas", "mi", "mis", "tu", "tus", "nuestro",
-    "nuestra", "nuestros", "nuestras", "a", "ha", "he", "ser", "estar",
-    "haber", "hacer", "tener", "poder", "deber", "ir", "dar", "ver", "saber",
-}
-
-NEXOS_VALIDOS = {
-    "de", "del", "para", "sobre", "en", "con", "por", "ante", "hacia", "entre",
-    "sin", "al", "las", "los", "una", "uno", "la", "el", "y", "o", "a", "e", "u",
-    "contra", "desde", "hasta", "tras", "mediante",
-}
-
-RE_VERBO_CONJUGADO = re.compile(
-    r"\b(presenta|presentan|anuncia|anuncian|lanza|lanzan|inaugura|inauguran|"
-    r"realiza|realizan|desarrolla|desarrollan|ejecuta|ejecutan|gestiona|gestionan|"
-    r"impulsa|impulsan|promueve|promueven|lidera|lideran|encabeza|encabezan|"
-    r"aprueba|aprueban|firma|firman|suscribe|suscriben|invierte|invierten|"
-    r"construye|construyen|instala|instalan|entrega|entregan|recibe|reciben|"
-    r"solicita|solicitan|visita|visitan|atiende|atienden|destaca|destacan|"
-    r"senala|senalan|indica|indican|expresa|expresan|afirma|afirman|"
-    r"propone|proponen|pide|piden|exige|exigen|apoya|apoyan|abre|abren|"
-    r"informa|informan|reporta|reportan|advierte|advierten|confirma|confirman)\b",
-    re.IGNORECASE,
-)
-
-ETIQUETAS_GENERICAS = {
-    "gestion", "actividades", "acciones", "noticias", "informacion", "eventos",
-    "varios", "sin tema", "actividad corporativa", "gestion corporativa",
-    "economia", "politica", "tecnologia", "seguridad", "justicia", "actualidad",
-    "nacional", "internacional", "empresas", "sociedad", "negocios", "general",
-    "cobertura informativa general", "otros", "otras noticias",
-    # Frases nominales bien formadas pero que no dicen nada del hecho concreto:
-    # pasaban el validador de estructura y acababan agrupando lo incomparable.
-    "gestion institucional", "gestion administrativa", "gestion publica",
-    "gestion empresarial", "actividad institucional", "agenda institucional",
-    "temas de actualidad", "temas de interes", "asuntos de interes general",
-    "informacion de interes", "informacion general", "cobertura de medios",
-    "noticias del sector", "novedades del sector", "panorama del sector",
-    "situacion actual del pais", "coyuntura nacional", "contexto economico",
-    "desarrollo economico y social", "desarrollo del pais", "avances del sector",
-    "impacto en la comunidad", "opinion publica", "declaraciones de autoridades",
-    "anuncios oficiales", "comunicados de prensa", "resumen de noticias",
-    "hechos destacados", "sucesos de la region", "eventos del sector",
-}
-
-# Pares de acciones que impiden fusionar dos grupos aunque el embedding los
-# considere casi idénticos: "aprobación de la reforma" y "rechazo de la reforma"
-# viven en el mismo campo semántico pero son noticias opuestas.
-ACCIONES_OPUESTAS: List[Tuple[set, set]] = [
-    ({"aprobacion", "aprueba", "aprobado", "apoyo", "acuerdo", "aval", "respaldo", "avala"},
-     {"rechazo", "rechaza", "rechazado", "desacuerdo", "oposicion", "critica", "niega", "veto"}),
-    ({"aumento", "crecimiento", "alza", "subida", "incremento", "sube", "crece", "record"},
-     {"caida", "reduccion", "baja", "disminucion", "descenso", "cae", "desploma", "recorte"}),
-    ({"apertura", "inauguracion", "inicio", "lanzamiento", "estreno", "abre", "reabre"},
-     {"cierre", "suspension", "clausura", "cancelacion", "cierra", "suspende", "liquidacion"}),
-    ({"exito", "logro", "triunfo", "premio", "reconocimiento", "gana", "ganador"},
-     {"fracaso", "derrota", "problema", "crisis", "sancion", "pierde", "escandalo"}),
-    ({"demanda", "denuncia", "investigacion", "sancion", "multa", "condena", "imputacion"},
-     {"absolucion", "archivo", "exoneracion", "sobreseimiento", "inocente"}),
-    ({"contratacion", "empleo", "vinculacion", "contrata"},
-     {"despido", "despidos", "desvinculacion", "recorte", "liquidacion"}),
-    ({"ganancias", "utilidades", "superavit", "rentabilidad"},
-     {"perdidas", "deficit", "quiebra", "insolvencia"}),
-]
-
-
-def normalizar_texto(s: Any) -> str:
-    """Minúsculas sin tildes ni puntuación, con stopwords eliminadas."""
-    if not s:
-        return ""
-    s = unidecode(str(s).lower())
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    return " ".join(t for t in s.split() if t not in _PE_STOPWORDS)
-
-
-def normalizar_titular(t: Any) -> str:
-    """Quita la firma del medio y el antetítulo para comparar titulares.
-
-    Los medios publican el mismo teletipo como "Titular real | El Tiempo" o
-    "ÚLTIMA HORA: titular real"; sin esta limpieza, dos copias exactas de la
-    misma nota puntúan bajo en similitud de cadena.
-    """
-    if not isinstance(t, str):
-        return ""
-    limpio = re.sub(r"\s+[\|–—-]\s+[^\|–—-]+$", "", t).strip()
-    if ":" in limpio:
-        partes = limpio.split(":", 1)
-        sufijo = partes[1].strip()
-        if len(sufijo) >= 10:
-            limpio = sufijo
-    return re.sub(r"\W+", " ", limpio).lower().strip()
-
-
-def tokens_distintivos(texto: str, min_len: int = 4) -> set:
-    return {
-        t
-        for t in normalizar_texto(texto).split()
-        if len(t) >= min_len and t not in TOKENS_DEBILES and not t.isdigit()
-    }
-
-
-def overlap_distintivo(a: str, b: str) -> float:
-    """Solapamiento sobre el conjunto más pequeño (contención, no Jaccard).
-
-    Un titular breve contenido en un cuerpo largo debe puntuar alto; Jaccard lo
-    penalizaría por la diferencia de tamaño.
-    """
-    ta, tb = tokens_distintivos(a), tokens_distintivos(b)
-    if not ta or not tb:
-        return 0.0
-    return len(ta & tb) / max(1, min(len(ta), len(tb)))
-
-
-def hay_conflicto_accion(a: str, b: str) -> bool:
-    ta = tokens_distintivos(a, min_len=3)
-    tb = tokens_distintivos(b, min_len=3)
-    for grupo_a, grupo_b in ACCIONES_OPUESTAS:
-        if (ta & grupo_a and tb & grupo_b) or (ta & grupo_b and tb & grupo_a):
-            return True
-    return False
-
-
-def jaccard(a: set, b: set) -> float:
-    if not a or not b:
-        return 0.0
-    return len(a & b) / len(a | b)
-
-
-# ==============================================================================
-# 3 · ENTIDADES  (la señal que faltaba)
-# ==============================================================================
-
-RE_SIGLA = re.compile(r"\b[A-ZÁÉÍÓÚÑ]{2,7}\b")
-RE_PROPIO = re.compile(
-    r"\b[A-ZÁÉÍÓÚÑ][a-záéíóúñ]{2,}"
-    r"(?:\s+(?:de|del|la|los|las|y)\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]{2,})*"
-)
-RE_CIFRA = re.compile(
-    r"\b\d[\d.,]{1,}\s*(?:%|millones|millón|millon|mil|billones|"
-    r"pesos|dólares|dolares|usd|cop|km|kw|mw|toneladas)?",
-    re.IGNORECASE,
-)
-RE_FECHA_ANO = re.compile(r"\b(?:19|20)\d{2}\b")
-
-# Palabras que abren frase o son cargos y aparecen capitalizadas por gramática,
-# no por ser entidades.
-NO_ENTIDADES = {
-    "el", "la", "los", "las", "un", "una", "este", "esta", "esto", "ese", "esa",
-    "por", "para", "con", "sin", "sobre", "entre", "desde", "hasta", "durante",
-    "segun", "ademas", "tras", "ante", "pero", "aunque", "mientras", "cuando",
-    "sin", "asi", "tambien", "aun", "todo", "toda", "cada", "otro", "otra",
-    "alcalde", "alcaldesa", "gobernador", "gobernadora", "ministro", "ministra",
-    "presidente", "presidenta", "director", "directora", "gerente", "senador",
-    "senadora", "representante", "concejal", "secretario", "secretaria",
-    "lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo",
-    "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
-    "septiembre", "octubre", "noviembre", "diciembre",
-    "nuevo", "nueva", "gran", "primer", "primera", "segundo", "ultimo",
-}
-
-SIGLAS_VACIAS = {"EL", "LA", "LOS", "DE", "DEL", "EN", "UN", "SE", "NO", "SI", "ES", "AL", "POR"}
-
-
-def _es_title_case(texto: str) -> bool:
-    """Detecta titulares escritos con Todas Las Palabras En Mayúscula.
-
-    En ese formato la mayúscula deja de señalar nombre propio y la extracción
-    debe ignorar el titular para no inventar entidades en cada palabra.
-    """
-    palabras = [p for p in texto.split() if len(p) > 2 and p[0].isalpha()]
-    if len(palabras) < 4:
-        return False
-    con_mayus = sum(1 for p in palabras if p[0].isupper())
-    return con_mayus / len(palabras) >= 0.65
-
-
-def extraer_entidades(titulo: str, cuerpo: str = "") -> set:
-    """Nombres propios, siglas y cifras significativas de una noticia.
-
-    Sin dependencias de NLP pesadas (spaCy no está en requirements y añadiría
-    ~500 MB al contenedor de Streamlit). La precisión de esta heurística es
-    suficiente porque no se usa para etiquetar, solo para *vetar* fusiones.
-    """
-    titulo = str(titulo or "")
-    cuerpo = str(cuerpo or "")
-    ents: set = set()
-
-    fuentes = []
-    if titulo and not _es_title_case(titulo):
-        fuentes.append(titulo)
-    fuentes.append(cuerpo[:2500])
-
-    for fuente in fuentes:
-        if not fuente:
-            continue
-        for m in RE_PROPIO.finditer(fuente):
-            bruto = m.group(0).strip()
-            norm = unidecode(bruto.lower())
-            cabeza = norm.split()[0] if norm.split() else ""
-            if cabeza in NO_ENTIDADES or len(cabeza) < 4:
-                continue
-            ents.add(norm)
-        for m in RE_SIGLA.finditer(fuente):
-            s = m.group(0)
-            if s in SIGLAS_VACIAS or len(s) < 3:
-                continue
-            ents.add(unidecode(s.lower()))
-
-    texto_cifras = f"{titulo} {cuerpo[:1500]}"
-    for m in RE_CIFRA.finditer(texto_cifras):
-        bruto = m.group(0).strip().lower()
-        digitos = re.sub(r"\D", "", bruto)
-        # Una cifra es identificadora si es grande o lleva unidad; "3 personas"
-        # no distingue una noticia de otra.
-        if len(digitos) >= 4 or re.search(r"[a-z%]", bruto):
-            if not RE_FECHA_ANO.fullmatch(bruto):
-                ents.add(re.sub(r"\s+", "", unidecode(bruto)))
-
-    return ents
-
-
-class IndiceEntidades:
-    """Índice de entidades con filtro IDF.
-
-    Una entidad que aparece en la mayoría del corpus ("Colombia" en un dossier
-    colombiano) tiene poder discriminante nulo. Solo las entidades por debajo del
-    umbral de frecuencia documental se consideran "fuertes" y pueden vetar o
-    avalar una fusión.
-    """
-
-    def __init__(self, entidades_por_doc: List[set], cfg: ConfigPrecision):
-        self.n = len(entidades_por_doc)
-        self.crudas = entidades_por_doc
-        df: Counter = Counter()
-        for ents in entidades_por_doc:
-            for e in ents:
-                df[e] += 1
-        tope = max(2, int(self.n * cfg.df_max_entidad_fuerte))
-        self.df = df
-        self.fuertes: List[set] = [{e for e in ents if df[e] <= tope} for ents in entidades_por_doc]
-        self.tope_df = tope
-
-    def indice_invertido(self) -> Dict[str, List[int]]:
-        """Entidad -> documentos. Genera pares candidatos sin comparar n×n."""
-        inv: Dict[str, List[int]] = defaultdict(list)
-        for i, ents in enumerate(self.fuertes):
-            for e in ents:
-                inv[e].append(i)
-        return inv
-
-
-# ==============================================================================
-# 4 · DECISIÓN DE FUSIÓN  (el corazón de "no agrupar generalizadamente")
-# ==============================================================================
-
-class DSUPrecision:
-    def __init__(self, n: int):
-        self.p = list(range(n))
-        self.rank = [0] * n
-
-    def find(self, i: int) -> int:
-        raiz = i
-        while self.p[raiz] != raiz:
-            raiz = self.p[raiz]
-        while self.p[i] != raiz:
-            self.p[i], i = raiz, self.p[i]
-        return raiz
-
-    def union(self, i: int, j: int) -> bool:
-        ri, rj = self.find(i), self.find(j)
-        if ri == rj:
-            return False
-        if self.rank[ri] < self.rank[rj]:
-            ri, rj = rj, ri
-        self.p[rj] = ri
-        if self.rank[ri] == self.rank[rj]:
-            self.rank[ri] += 1
-        return True
-
-    def grupos(self) -> Dict[int, List[int]]:
-        c: Dict[int, List[int]] = defaultdict(list)
-        for i in range(len(self.p)):
-            c[self.find(i)].append(i)
-        return dict(c)
-
-    def etiquetas(self) -> List[int]:
-        raices = {}
-        salida = []
-        for i in range(len(self.p)):
-            r = self.find(i)
-            if r not in raices:
-                raices[r] = len(raices)
-            salida.append(raices[r])
-        return salida
-
-
-def decidir_union(
-    sim: float,
-    i: int,
-    j: int,
-    textos: Sequence[str],
-    idx_ents: IndiceEntidades,
-    cfg: ConfigPrecision,
-    tel: Telemetria,
-    *,
-    nivel: str = "asunto",
-) -> bool:
-    """¿Son `i` y `j` la misma noticia / el mismo asunto?
-
-    Exige DOS familias de señales independientes. El embedding por sí solo agrupa
-    "subida del precio del café" con "caída del precio del cacao": misma forma,
-    hecho distinto. La regla de veto por entidades es la que evita esas fusiones.
-    """
-    if nivel == "identidad":
-        piso, umbral = cfg.sim_identidad, cfg.sim_identidad
-    elif nivel == "tema":
-        piso, umbral = cfg.piso_absoluto_tema, cfg.sim_tema
-    else:
-        piso, umbral = cfg.piso_absoluto_asunto, cfg.sim_asunto
-
-    if sim < piso:
-        return False
-
-    ta, tb = textos[i], textos[j]
-
-    if hay_conflicto_accion(ta, tb):
-        tel.uniones_rechazadas_conflicto += 1
-        return False
-
-    # Republicación literal: la similitud es tan alta que no cabe otra lectura.
-    if sim >= cfg.sim_republicacion:
-        return True
-
-    ea, eb = idx_ents.fuertes[i], idx_ents.fuertes[j]
-    jac_ent = jaccard(ea, eb)
-    ov = overlap_distintivo(ta, tb)
-
-    # VETO POR ENTIDADES: ambas noticias identifican actores/cifras concretos y
-    # no comparten ninguno -> hablan de hechos distintos, por alto que sea `sim`.
-    if nivel != "tema":
-        if (
-            len(ea) >= cfg.min_entidades_para_exigir
-            and len(eb) >= cfg.min_entidades_para_exigir
-            and jac_ent == 0.0
-            and ov < 0.60
-        ):
-            tel.uniones_rechazadas_entidades += 1
-            return False
-
-    if sim < umbral:
-        return False
-
-    min_ov = cfg.overlap_tokens_min_tema if nivel == "tema" else cfg.overlap_tokens_min
-    if jac_ent >= cfg.jaccard_entidades_min or ov >= min_ov:
-        return True
-
-    tel.uniones_rechazadas_overlap += 1
-    return False
-
-
-def _pares_candidatos(
-    embs: np.ndarray,
-    validos: List[int],
-    cfg: ConfigPrecision,
-    piso: float,
-) -> List[Tuple[float, int, int]]:
-    """Pares por encima del piso, limitados a los k vecinos más próximos.
-
-    Sin el tope por ítem, un corpus temáticamente homogéneo genera O(n²) pares y
-    el coste de validarlos domina el tiempo total.
-    """
-    if len(validos) < 2:
-        return []
-
-    sim = cosine_similarity(embs)
-    np.fill_diagonal(sim, -1.0)
-    k = min(cfg.max_pares_por_item, len(validos) - 1)
-    pares: Dict[Tuple[int, int], float] = {}
-
-    vecinos = np.argpartition(-sim, kth=k - 1, axis=1)[:, :k] if k >= 1 else np.empty((len(validos), 0), int)
-    for a in range(len(validos)):
-        for b in vecinos[a]:
-            s = float(sim[a][b])
-            if s < piso:
-                continue
-            ia, ib = validos[a], validos[int(b)]
-            clave = (ia, ib) if ia < ib else (ib, ia)
-            pares[clave] = s
-
-    return sorted(((s, i, j) for (i, j), s in pares.items()), reverse=True)
-
-
-# ==============================================================================
-# 5 · NIVEL 0 y 1 · AGRUPACIÓN
-# ==============================================================================
-
-def construir_identidad(
-    titulos: Sequence[str],
-    resumenes: Sequence[str],
-    textos: Sequence[str],
-    embs: List[Optional[List[float]]],
-    idx_ents: IndiceEntidades,
-    cfg: ConfigPrecision,
-    tel: Telemetria,
-) -> List[int]:
-    """NIVEL 0 · agrupa republicaciones de la misma noticia."""
-    n = len(titulos)
-    dsu = DSUPrecision(n)
-
-    # a) Titulares idénticos tras normalizar (mismo teletipo en varios medios).
-    por_hash: Dict[str, List[int]] = defaultdict(list)
-    for i, t in enumerate(titulos):
-        norm = normalizar_titular(t)
-        if len(norm) >= 15:
-            por_hash[hashlib.md5(norm.encode()).hexdigest()].append(i)
-    for idxs in por_hash.values():
-        for j in idxs[1:]:
-            if dsu.union(idxs[0], j):
-                tel.uniones_identidad += 1
-
-    # b) Cuerpos idénticos.
-    por_cuerpo: Dict[str, List[int]] = defaultdict(list)
-    for i, r in enumerate(resumenes):
-        norm = " ".join(normalizar_texto(r).split()[:120])
-        if len(norm.split()) >= 25:
-            por_cuerpo[hashlib.md5(norm.encode()).hexdigest()].append(i)
-    for idxs in por_cuerpo.values():
-        for j in idxs[1:]:
-            if dsu.union(idxs[0], j):
-                tel.uniones_identidad += 1
-
-    # c) Titulares casi idénticos + validación semántica.
-    norms = [normalizar_titular(t) for t in titulos]
-    validos = [i for i in range(n) if embs[i] is not None]
-    if len(validos) >= 2:
-        M = np.array([embs[i] for i in validos])
-        for sim, i, j in _pares_candidatos(M, validos, cfg, cfg.sim_identidad):
-            if dsu.find(i) == dsu.find(j):
-                continue
-            ratio = SequenceMatcher(None, norms[i], norms[j]).ratio() if norms[i] and norms[j] else 0.0
-            if ratio >= cfg.ratio_titulo_identico or sim >= cfg.sim_republicacion:
-                if decidir_union(sim, i, j, textos, idx_ents, cfg, tel, nivel="identidad"):
-                    if dsu.union(i, j):
-                        tel.uniones_identidad += 1
-
-    return dsu.etiquetas()
-
-
-def construir_asunto(
-    textos: Sequence[str],
-    embs: List[Optional[List[float]]],
-    id_identidad: List[int],
-    idx_ents: IndiceEntidades,
-    cfg: ConfigPrecision,
-    tel: Telemetria,
-) -> List[int]:
-    """NIVEL 1 · agrupa noticias distintas sobre el mismo hecho.
-
-    Opera sobre los centroides de nivel 0, no sobre las notas sueltas: promediar
-    las republicaciones cancela el ruido de cada redacción y deja la señal del
-    hecho, además de reducir el número de comparaciones.
-    """
-    n = len(textos)
-    clusters_id: Dict[int, List[int]] = defaultdict(list)
-    for i, c in enumerate(id_identidad):
-        clusters_id[c].append(i)
-
-    ids = sorted(clusters_id.keys())
-    centroides: Dict[int, np.ndarray] = {}
-    representantes: Dict[int, int] = {}
-    for c in ids:
-        vecs = [embs[i] for i in clusters_id[c] if embs[i] is not None]
-        if vecs:
-            centroides[c] = np.mean(vecs, axis=0)
-            representantes[c] = clusters_id[c][0]
-
-    validos = [c for c in ids if c in centroides]
-    dsu = DSUPrecision(len(ids))
-    pos = {c: k for k, c in enumerate(ids)}
-
-    if len(validos) >= 2:
-        M = np.array([centroides[c] for c in validos])
-        sim = cosine_similarity(M)
-        np.fill_diagonal(sim, 0.0)
-
-        # `complete` linkage: TODOS los pares del cluster superan el umbral. Con
-        # `average` (el original) basta con que la media lo supere, lo que
-        # permite encadenamientos A-B-C donde A y C no se parecen en nada.
-        dist = np.clip(1.0 - sim, 0.0, 2.0)
-        np.fill_diagonal(dist, 0.0)
-        etiquetas = AgglomerativeClustering(
-            n_clusters=None,
-            distance_threshold=1.0 - cfg.sim_asunto,
-            metric="precomputed",
-            linkage="complete",
-        ).fit(dist).labels_
-
-        provisional: Dict[int, List[int]] = defaultdict(list)
-        for k, lbl in enumerate(etiquetas):
-            provisional[lbl].append(k)
-
-        # El clustering solo propone; la unión se confirma par a par con las
-        # señales léxicas y de entidades.
-        for miembros in provisional.values():
-            if len(miembros) < 2:
-                continue
-            for a in range(len(miembros)):
-                for b in range(a + 1, len(miembros)):
-                    ka, kb = miembros[a], miembros[b]
-                    ca, cb = validos[ka], validos[kb]
-                    ia, ib = representantes[ca], representantes[cb]
-                    if decidir_union(
-                        float(sim[ka][kb]), ia, ib, textos, idx_ents, cfg, tel, nivel="asunto"
-                    ):
-                        if dsu.union(pos[ca], pos[cb]):
-                            tel.uniones_asunto += 1
-
-    mapa_cluster = dsu.etiquetas()
-    salida = [0] * n
-    for c in ids:
-        for i in clusters_id[c]:
-            salida[i] = mapa_cluster[pos[c]]
-    return salida
-
-
-# ==============================================================================
-# 6 · LLAMADAS AL MODELO
-# ==============================================================================
-
-def _extraer_json(bruto: str) -> Optional[dict]:
-    if not bruto:
-        return None
-    bruto = bruto.strip()
-    if bruto.startswith("```"):
-        bruto = re.sub(r"^```(?:json)?\s*|\s*```$", "", bruto, flags=re.IGNORECASE)
-    try:
-        obj = json.loads(bruto)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        pass
-    m = re.search(r"\{.*\}", bruto, re.DOTALL)
-    if m:
-        try:
-            obj = json.loads(m.group(0))
-            return obj if isinstance(obj, dict) else None
-        except Exception:
-            return None
-    return None
-
-
-def _registrar_uso(resp: Any, ctx: EngineContext) -> None:
-    u = resp.get("usage", {}) if isinstance(resp, dict) else getattr(resp, "usage", None)
-    if not u:
-        return
-    pin = (u.get("prompt_tokens") if isinstance(u, dict) else getattr(u, "prompt_tokens", 0)) or 0
-    pout = (u.get("completion_tokens") if isinstance(u, dict) else getattr(u, "completion_tokens", 0)) or 0
-    ctx.tel.tokens_in += pin
-    ctx.tel.tokens_out += pout
-    if ctx.on_tokens:
-        ctx.on_tokens(pin, pout)
-
-
-async def chat_json_async(
-    sistema: str,
-    usuario: str,
-    ctx: EngineContext,
-    *,
-    max_tokens: int = 160,
-    temperature: float = 0.0,
-    intentos: int = 4,
-) -> Optional[dict]:
-    """Llamada JSON con backoff exponencial + jitter y telemetría por tipo de fallo.
-
-    A diferencia del `except: pass` original, distingue error de API de respuesta
-    mal formada: solo así se puede saber si un informe lleno de "Neutro" refleja
-    la realidad o una tanda de 429s.
-    """
-    espera = 1.0
-    for intento in range(intentos):
-        try:
-            resp = await openai.ChatCompletion.acreate(
-                model=ctx.modelo,
-                messages=[
-                    {"role": "system", "content": sistema},
-                    {"role": "user", "content": usuario},
-                ],
-                max_tokens=max_tokens,
-                temperature=temperature,
-                seed=ctx.seed,
-                response_format={"type": "json_object"},
-            )
-            _registrar_uso(resp, ctx)
-            datos = _extraer_json(resp.choices[0].message.content)
-            if datos is None:
-                ctx.tel.llamadas_json_invalido += 1
-                return None
-            ctx.tel.llamadas_ok += 1
-            return datos
-        except _ERROR_RATE_LIMIT:
-            ctx.tel.llamadas_rate_limit += 1
-            if intento == intentos - 1:
-                ctx.tel.llamadas_error += 1
-                return None
-            await asyncio.sleep(espera + random.uniform(0, espera * 0.5))
-            espera *= 2
-        except _ERRORES_REINTENTABLES:
-            if intento == intentos - 1:
-                ctx.tel.llamadas_error += 1
-                return None
-            await asyncio.sleep(espera + random.uniform(0, espera * 0.5))
-            espera *= 2
-        except Exception:
-            ctx.tel.llamadas_error += 1
-            return None
-    ctx.tel.llamadas_error += 1
-    return None
-
-
-async def _mapear(coros: List[Any], limite: int) -> List[Any]:
-    sem = asyncio.Semaphore(limite)
-
-    async def _envuelto(c):
-        async with sem:
-            return await c
-
-    return await asyncio.gather(*[_envuelto(c) for c in coros])
-
-
-# ==============================================================================
-# 7 · TONO
-# ==============================================================================
-
-SISTEMA_TONO = (
-    "Eres analista senior de reputación corporativa. Evalúas el impacto "
-    "reputacional DIRECTO de una noticia sobre una marca concreta, no el clima "
-    "emocional del texto. Respondes únicamente con JSON válido."
-)
-
-
-def texto_para_llm(titulo: Any, cuerpo: Any, max_chars: int = 2400) -> str:
-    """Texto para el prompt: titular una vez + cuerpo.
-
-    El pipeline original enviaba al clasificador el mismo string usado para
-    embeddings, que repite el titular TRES veces ("T. T. T. cuerpo") para
-    ponderarlo en el vector. Esa repetición es correcta para el embedding y
-    dañina para el prompt: consumía ~2 de cada 3 caracteres del titular y
-    truncaba el cuerpo, que es justamente donde está el hecho reputacional.
-    """
-    t = str(titulo or "").strip()
-    c = str(cuerpo or "").strip()
-    if c.lower() in ("nan", "none"):
-        c = ""
-    disponible = max(200, max_chars - len(t) - 24)
-    return f"TITULAR: {t}\nCUERPO: {c[:disponible]}".strip()
-
-
-def _pe_texto_para_embedding(titulo: Any, resumen: Any, max_len: int = 1800) -> str:
-    """Se mantiene la triplicación: aquí sí pondera el titular en el vector."""
-    t = str(titulo or "").strip()
-    r = str(resumen or "").strip()
-    if r.lower() in ("nan", "none"):
-        r = ""
-    return f"{t}. {t}. {t}. {r}"[:max_len]
-
-
-def _pe_normalizar_mencion(texto: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", unidecode(str(texto).lower()))).strip()
-
-
-class DetectorMarca:
-    """Detecta la marca con límites de palabra y mide su prominencia.
-
-    Que la marca esté en el titular o aparezca cinco veces frente a una sola
-    mención de pasada cambia por completo la lectura reputacional, así que esa
-    señal se le entrega explícitamente al modelo.
-    """
-
-    def __init__(self, marca: str, aliases: Sequence[str]):
-        self.marca = (marca or "").strip()
-        self.aliases = [a.strip() for a in (aliases or []) if a and a.strip()]
-        self.nombres = [n for n in [self.marca] + self.aliases if len(n) >= 3]
-        self._patrones = [
-            re.compile(rf"(?<![a-z0-9]){re.escape(_pe_normalizar_mencion(n))}(?![a-z0-9])")
-            for n in self.nombres
-            if len(_pe_normalizar_mencion(n)) >= 3
-        ]
-
-    def contar(self, texto: str) -> int:
-        t = _pe_normalizar_mencion(texto)
-        return sum(len(p.findall(t)) for p in self._patrones)
-
-    def menciona(self, texto: str) -> bool:
-        return self.contar(texto) > 0
-
-    def en_titular(self, titulo: str) -> bool:
-        return self.contar(titulo) > 0
-
-
-def _prompt_tono(marca: str, aliases: Sequence[str], texto: str, en_titular: bool, n_menciones: int) -> str:
-    alias_str = f"\nTAMBIÉN LLAMADA: {', '.join(aliases)}" if aliases else ""
-    return (
-        f"MARCA EVALUADA: {marca}{alias_str}\n"
-        f"SEÑALES: aparece en el titular: {'SÍ' if en_titular else 'NO'} · "
-        f"menciones en el texto: {n_menciones}\n\n"
-        f"NOTICIA\n{texto}\n\n"
-        "Analiza en este orden:\n"
-        "1. hecho: el hecho principal que involucra a la marca (máx. 15 palabras).\n"
-        "2. afectado: quién recibe el efecto de ese hecho.\n"
-        "   \"marca\" | \"tercero\" | \"sector\" | \"nadie\"\n"
-        "3. tono: efecto de ese hecho sobre la reputación de la marca.\n"
-        f"   Negativo -> el hecho perjudica, cuestiona o expone a {marca}: demanda, multa,\n"
-        "   fraude, falla propia, queja de clientes, investigación, pérdidas, retiro de\n"
-        "   producto, despidos, incumplimiento, accidente en sus instalaciones.\n"
-        f"   Positivo -> el hecho acredita un logro verificable de {marca}: premio,\n"
-        "   crecimiento, inversión ejecutada, lanzamiento exitoso, innovación, expansión,\n"
-        "   reconocimiento, alianza favorable, aporte social propio.\n"
-        "   Neutro -> la marca aparece sin efecto sobre su imagen: mención en una lista,\n"
-        "   dato de mercado, patrocinio menor, comunicado rutinario, contexto sectorial,\n"
-        "   o el afectado es un tercero.\n"
-        "4. confianza: 0.0 a 1.0.\n\n"
-        "REGLAS\n"
-        "- Si el afectado no es la marca, el tono es Neutro.\n"
-        "- No infieras el tono por palabras emocionales ni por la gravedad general.\n"
-        "- Una tragedia, crisis o polémica ajena a la marca es Neutro.\n"
-        "- Que la noticia sea sobre el sector no la hace positiva ni negativa para la marca.\n"
-        "- Ante duda razonable: Neutro con confianza baja.\n\n"
-        'Responde JSON: {"hecho":"...","afectado":"marca|tercero|sector|nadie",'
-        '"tono":"Positivo|Negativo|Neutro","confianza":0.0}'
-    )
-
-
-def _prompt_revision_tono(marca: str, texto: str, previo: dict) -> str:
-    return (
-        f"MARCA EVALUADA: {marca}\n\n"
-        f"NOTICIA\n{texto}\n\n"
-        f"Un primer analista concluyó: tono={previo.get('tono', 'Neutro')}, "
-        f"hecho=\"{previo.get('hecho', '')}\", afectado={previo.get('afectado', 'nadie')}, "
-        f"pero con baja confianza.\n\n"
-        "Revísalo de forma crítica y decide el tono definitivo. Pregúntate:\n"
-        f"- ¿El hecho recae sobre {marca} o sobre un tercero?\n"
-        f"- ¿Un directivo de {marca} celebraría o lamentaría esta publicación, "
-        "o le sería indiferente?\n"
-        "- ¿La clasificación anterior confundió el clima emocional del texto con el "
-        "impacto real sobre la marca?\n\n"
-        "Si tras la revisión sigue habiendo duda razonable, responde Neutro.\n\n"
-        'Responde JSON: {"motivo":"máx 20 palabras","tono":"Positivo|Negativo|Neutro","confianza":0.0}'
-    )
-
-
-class MotorTono:
-    def __init__(self, marca: str, aliases: Sequence[str], ctx: EngineContext, cfg: ConfigPrecision):
-        self.detector = DetectorMarca(marca, aliases)
-        self.marca = marca
-        self.aliases = list(aliases or [])
-        self.ctx = ctx
-        self.cfg = cfg
-
-    async def _clasificar(self, titulo: str, cuerpo: str, tam_grupo: int) -> Tuple[str, float]:
-        texto_completo = f"{titulo} {cuerpo}"
-        n_men = self.detector.contar(texto_completo)
-
-        # Sin mención literal de la marca no hay impacto reputacional que medir.
-        # Se decide en local: ahorra la llamada y elimina el falso positivo por
-        # "la noticia va de banca, luego afecta al banco".
-        if n_men == 0:
-            self.ctx.tel.tono_sin_mencion += 1
-            return "Neutro", 1.0
-
-        texto = texto_para_llm(titulo, cuerpo)
-        datos = await chat_json_async(
-            SISTEMA_TONO,
-            _prompt_tono(self.marca, self.aliases, texto, self.detector.en_titular(titulo), n_men),
-            self.ctx,
-            max_tokens=180,
-        )
-        if not datos:
-            self.ctx.tel.tono_baja_confianza_final += 1
-            return "Neutro", 0.0
-
-        tono = str(datos.get("tono", "Neutro")).strip().capitalize()
-        if tono not in ("Positivo", "Negativo", "Neutro"):
-            tono = "Neutro"
-        afectado = str(datos.get("afectado", "")).strip().lower()
-        try:
-            confianza = float(datos.get("confianza", 0.5))
-        except (TypeError, ValueError):
-            confianza = 0.5
-        confianza = min(max(confianza, 0.0), 1.0)
-
-        # Red de seguridad: el modelo a veces marca "afectado: sector" y aun así
-        # devuelve Negativo. La regla se aplica en código, no solo en el prompt.
-        if afectado in ("tercero", "sector", "nadie") and tono != "Neutro":
-            self.ctx.tel.tono_forzado_neutro_por_afectado += 1
-            tono, confianza = "Neutro", max(confianza, 0.75)
-
-        necesita_revision = confianza < self.cfg.confianza_minima_tono or (
-            tono != "Neutro" and tam_grupo >= self.cfg.revisar_grupos_grandes
-        )
-        if necesita_revision:
-            self.ctx.tel.tono_revisado += 1
-            revision = await chat_json_async(
-                SISTEMA_TONO,
-                _prompt_revision_tono(self.marca, texto_para_llm(titulo, cuerpo, max_chars=3200), datos),
-                self.ctx,
-                max_tokens=140,
-            )
-            if revision:
-                nuevo = str(revision.get("tono", tono)).strip().capitalize()
-                if nuevo in ("Positivo", "Negativo", "Neutro"):
-                    if nuevo != tono:
-                        self.ctx.tel.tono_cambiado_en_revision += 1
-                    tono = nuevo
-                    try:
-                        confianza = min(max(float(revision.get("confianza", confianza)), 0.0), 1.0)
-                    except (TypeError, ValueError):
-                        pass
-
-        if confianza < 0.5:
-            self.ctx.tel.tono_baja_confianza_final += 1
-        return tono, confianza
-
-    async def procesar(
-        self,
-        titulos: Sequence[str],
-        resumenes: Sequence[str],
-        id_identidad: List[int],
-        embs: List[Optional[List[float]]],
-        progreso: Optional[Callable[[float, str], None]] = None,
-    ) -> Tuple[List[str], List[float]]:
-        """Una clasificación por cluster de identidad, propagada al resto.
-
-        A diferencia del original, la propagación NO es incondicional: una nota
-        del cluster que no nombra la marca recibe Neutro, aunque el representante
-        sea Negativo. Las republicaciones no siempre conservan la mención.
-        """
-        n = len(titulos)
-        clusters: Dict[int, List[int]] = defaultdict(list)
-        for i, c in enumerate(id_identidad):
-            clusters[c].append(i)
-
-        # El representante es la nota más completa del cluster, no la más cercana
-        # al centroide: clasificar sobre un teletipo de dos líneas cuando existe
-        # la versión desarrollada desperdicia la evidencia disponible.
-        representantes: Dict[int, int] = {}
-        for c, idxs in clusters.items():
-            representantes[c] = max(idxs, key=lambda i: len(str(resumenes[i] or "")))
-
-        ids = sorted(clusters.keys())
-        if progreso:
-            progreso(0.05, f"Tono · {len(ids)} grupos únicos de {n} noticias")
-
-        coros = [
-            self._clasificar(str(titulos[representantes[c]]), str(resumenes[representantes[c]]), len(clusters[c]))
-            for c in ids
-        ]
-        resultados = await _mapear(coros, self.ctx.max_concurrencia)
-
-        tonos = ["Neutro"] * n
-        confianzas = [1.0] * n
-        for c, (tono, conf) in zip(ids, resultados):
-            for i in clusters[c]:
-                if tono != "Neutro" and not self.detector.menciona(f"{titulos[i]} {resumenes[i]}"):
-                    tonos[i], confianzas[i] = "Neutro", 1.0
-                else:
-                    tonos[i], confianzas[i] = tono, conf
-
-        if progreso:
-            progreso(1.0, "Tono completado")
-        return tonos, confianzas
-
-
-# ==============================================================================
-# 8 · ETIQUETAS (subtema)
-# ==============================================================================
-
-SISTEMA_SUBTEMA = (
-    "Eres editor jefe de un diario. Nombras el asunto de un grupo de noticias "
-    "con una frase nominal breve en español, sin verbos conjugados ni sujeto. "
-    "Respondes únicamente con JSON válido."
-)
-
-
-def capitalizar(etiqueta: str) -> str:
-    if not etiqueta or not etiqueta.strip():
-        return "Sin tema"
-    # El modelo devuelve con frecuencia texto sin tildes ni eñes; la etiqueta
-    # llega al Excel tal cual, así que se restauran aquí y no en la vista.
-    e = corregir_tildes(etiqueta.strip())
-    return e[0].upper() + e[1:]
-
-
-def recortar_frase(texto: str, max_palabras: int = 7) -> str:
-    """Recorta y elimina la cola incompleta ('Proyecto de terminal de' -> ...)."""
-    if not texto:
-        return ""
-    palabras = texto.strip().split()
-    if len(palabras) > max_palabras:
-        palabras = palabras[:max_palabras]
-    while palabras and unidecode(palabras[-1].lower().rstrip(".,;:!?")) in PALABRAS_CORTE_ETIQUETA:
-        palabras.pop()
-    return " ".join(palabras)
-
-
-def frase_completa(texto: str) -> bool:
-    if not texto or not texto.strip():
-        return False
-    palabras = texto.strip().split()
-    if not palabras:
-        return False
-    ultima = unidecode(palabras[-1].lower().rstrip(".,;:!?"))
-    return ultima not in PALABRAS_CORTE_ETIQUETA and len(ultima) > 1
-
-
-def limpiar_etiqueta(bruto: str, marca: str = "", aliases: Sequence[str] = ()) -> str:
-    """Normaliza la salida del modelo y borra la marca del texto."""
-    if not bruto:
-        return ""
-    t = str(bruto).strip().strip("\"'`")
-    for px in ("subtema:", "tema:", "categoría:", "categoria:", "category:", "asunto:"):
-        if t.lower().startswith(px):
-            t = t[len(px):].strip()
-    t = re.sub(r"\s+", " ", t).strip(" .,;:")
-
-    if marca:
-        for nombre in [marca] + [a for a in aliases if a]:
-            nn = unidecode(str(nombre).strip().lower())
-            if len(nn) < 3:
-                continue
-            t = re.sub(rf"\b{re.escape(nn)}\b", "", t, flags=re.IGNORECASE)
-            # También la forma con tildes tal cual aparece
-            t = re.sub(rf"\b{re.escape(str(nombre).strip())}\b", "", t, flags=re.IGNORECASE)
-
-    for frase in ("en colombia", "de colombia", "del pais", "del país",
-                  "en el pais", "en el país", "a nivel nacional", "en todo el pais"):
-        t = re.sub(rf"\b{re.escape(frase)}\b", "", t, flags=re.IGNORECASE)
-
-    t = re.sub(r"\s+", " ", t).strip(" .,;:-")
-    t = recortar_frase(t, max_palabras=7)
-    return t.lower() if t else ""
-
-
-def validar_subtema(etiqueta: str, cfg: ConfigPrecision) -> bool:
-    if not etiqueta:
-        return False
-    palabras = etiqueta.split()
-    if not (cfg.min_palabras_subtema <= len(palabras) <= cfg.max_palabras_subtema):
-        return False
-    if RE_VERBO_CONJUGADO.search(unidecode(etiqueta.lower())):
-        return False
-    if normalizar_texto(etiqueta) in {normalizar_texto(g) for g in ETIQUETAS_GENERICAS}:
-        return False
-    if not frase_completa(etiqueta):
-        return False
-    # Frases cortas necesitan nexo: "Tarifas energía" es telegráfico,
-    # "Tarifas de energía" es la forma periodística correcta.
-    if len(palabras) <= 4:
-        if not any(unidecode(p.lower().rstrip(".,;:")) in NEXOS_VALIDOS for p in palabras[1:]):
-            return False
-    return True
-
-
-def validar_tema(etiqueta: str, cfg: ConfigPrecision) -> bool:
-    if not etiqueta:
-        return False
-    palabras = etiqueta.split()
-    if not (cfg.min_palabras_tema <= len(palabras) <= cfg.max_palabras_tema):
-        return False
-    if re.match(r"^[0-9]", etiqueta):
-        return False
-    if RE_VERBO_CONJUGADO.search(unidecode(etiqueta.lower())):
-        return False
-    if normalizar_texto(etiqueta) in {normalizar_texto(g) for g in ETIQUETAS_GENERICAS}:
-        return False
-    return frase_completa(etiqueta)
-
-
-@dataclass
-class GrupoEtiquetable:
-    id_grupo: int
-    indices: List[int]
-    titulos: List[str]
-    resumenes: List[str]
-    entidades: set
-    centroide: Optional[np.ndarray] = None
-
-
-def _ordenar_por_representatividad(
-    indices: Sequence[int],
-    embs: Sequence[Optional[List[float]]],
-    centroide: Optional[np.ndarray],
-    resumenes: Sequence[str],
-) -> List[int]:
-    """Ordena un grupo poniendo delante lo más representativo y mejor documentado.
-
-    El prompt de etiquetado solo lee las primeras noticias del grupo. Si el orden
-    es el de llegada, un asunto de 60 notas se nombra a partir de 6 titulares
-    arbitrarios. Ordenando por cercanía al centroide (con la nota más extensa
-    promovida al frente) la etiqueta describe el núcleo del asunto y deja de
-    depender del orden del Excel.
-    """
-    idxs = list(indices)
-    if len(idxs) <= 1:
-        return idxs
-
-    if centroide is not None:
-        c = np.asarray(centroide, dtype=float)
-        norma_c = float(np.linalg.norm(c)) or 1.0
-
-        def _cercania(i: int) -> float:
-            e = embs[i]
-            if e is None:
-                return -1.0
-            v = np.asarray(e, dtype=float)
-            nv = float(np.linalg.norm(v)) or 1.0
-            return float(np.dot(v, c) / (nv * norma_c))
-
-        orden = sorted(idxs, key=lambda i: (-_cercania(i), i))
-    else:
-        orden = sorted(idxs, key=lambda i: (-len(str(resumenes[i] or "")), i))
-
-    # La nota más desarrollada aporta el contexto que a un teletipo le falta.
-    mas_extensa = max(idxs, key=lambda i: (len(str(resumenes[i] or "")), -i))
-    if orden and orden[0] != mas_extensa:
-        orden.remove(mas_extensa)
-        orden.insert(1 if len(orden) > 1 else 0, mas_extensa)
-    return orden
-
-
-def _fallback_etiqueta(titulos: Sequence[str], entidades: set, tel: Telemetria) -> str:
-    """Etiqueta sin LLM. Se registra: un informe lleno de fallbacks es una alarma."""
-    tel.etiquetas_fallback += 1
-    palabras = []
-    for t in list(titulos)[:6]:
-        for w in normalizar_texto(t).split():
-            if len(w) > 4 and w not in TOKENS_DEBILES:
-                palabras.append(w)
-    top = [w for w, _ in Counter(palabras).most_common(3)]
-    ent = sorted(entidades, key=len, reverse=True)
-    if len(top) >= 2:
-        return capitalizar(f"{top[0]} de {top[1]}")
-    if top and ent:
-        return capitalizar(f"{top[0]} de {ent[0]}")
-    if top:
-        return capitalizar(f"Asuntos de {top[0]}")
-    return "Cobertura informativa sin clasificar"
-
-
-def _prompt_subtema(g: GrupoEtiquetable, vocabulario: Sequence[str]) -> str:
-    titulares = list(dict.fromkeys(str(t)[:130] for t in g.titulos if t and str(t).strip().lower() != "nan"))[:6]
-    resumenes = [str(r)[:220] for r in g.resumenes[:3] if r and len(str(r)) > 20]
-
-    palabras = []
-    for t in g.titulos[:12]:
-        for w in normalizar_texto(t).split():
-            if len(w) > 3 and w not in TOKENS_DEBILES:
-                palabras.append(w)
-    kw = ", ".join(w for w, _ in Counter(palabras).most_common(8))
-    ents = ", ".join(sorted(g.entidades, key=len, reverse=True)[:6])
-
-    bloque_voc = ""
-    if vocabulario:
-        bloque_voc = (
-            "\n\nSUBTEMAS YA EXISTENTES EN ESTE INFORME:\n"
-            + "\n".join(f"  · {s}" for s in vocabulario)
-            + "\nSi este grupo trata EXACTAMENTE el mismo asunto que uno de ellos, "
-            "devuélvelo tal cual. Si el asunto es distinto, aunque sea del mismo "
-            "campo, crea uno nuevo. No fuerces la coincidencia."
-        )
-
-    return (
-        f"GRUPO DE {len(g.titulos)} NOTICIA(S)\n\n"
-        "TITULARES:\n" + "\n".join(f"  · {t}" for t in titulares)
-        + (("\n\nCONTEXTO:\n" + "\n".join(f"  · {r}" for r in resumenes)) if resumenes else "")
-        + (f"\n\nENTIDADES: {ents}" if ents else "")
-        + f"\n\nPALABRAS CLAVE: {kw}"
-        + bloque_voc
-        + "\n\nEscribe el SUBTEMA: frase nominal de 4 a 7 palabras que nombre el "
-        "ASUNTO concreto de estas noticias.\n\n"
-        "FORMATO OBLIGATORIO\n"
-        "- Empieza por sustantivo. Sin verbo conjugado. Sin sujeto ni cargo.\n"
-        "- Une los conceptos con preposición (de, del, para, sobre, en, por).\n"
-        "- Nombra el asunto, no el actor ni el género periodístico.\n"
-        "- Sin nombres de empresas privadas. Con tildes y ñ correctas.\n"
-        "- Las ciudades y regiones pueden aparecer si definen el asunto.\n\n"
-        "EJEMPLOS\n"
-        '  OK  "Ampliación de la red de acueducto"\n'
-        '  OK  "Regulación de tarifas de energía"\n'
-        '  OK  "Operación del Canal del Dique"\n'
-        '  MAL "Alcalde presenta obra"      (verbo + cargo)\n'
-        '  MAL "Gestión institucional"      (genérico)\n'
-        '  MAL "Tarifas energía"            (sin preposición)\n\n'
-        'Responde JSON: {"asunto":"qué ocurre, máx 12 palabras","subtema":"..."}'
-    )
-
-
-class EtiquetadorSubtemas:
-    """Etiqueta en dos rondas paralelas.
-
-    El original etiquetaba en bucle secuencial pasando al prompt las etiquetas ya
-    aprobadas, lo que producía sesgo de anclaje: los primeros grupos fijaban el
-    vocabulario y los siguientes reutilizaban esos nombres aunque no
-    correspondieran, con un orden que además dependía del tamaño de grupo.
-
-    Aquí:
-      Ronda A · todos los grupos se etiquetan en paralelo y sin ver a los demás.
-      Ronda B · las etiquetas equivalentes se detectan por embedding + contenido
-                y se unifican con una sola llamada por familia.
-    """
-
-    def __init__(self, marca: str, aliases: Sequence[str], ctx: EngineContext, cfg: ConfigPrecision):
-        self.marca = marca
-        self.aliases = list(aliases or [])
-        self.ctx = ctx
-        self.cfg = cfg
-
-    async def _etiquetar_grupo(self, g: GrupoEtiquetable, vocabulario: Sequence[str]) -> str:
-        datos = await chat_json_async(
-            SISTEMA_SUBTEMA, _prompt_subtema(g, vocabulario), self.ctx, max_tokens=140
-        )
-        if datos:
-            etiqueta = limpiar_etiqueta(datos.get("subtema", ""), self.marca, self.aliases)
-            if validar_subtema(etiqueta, self.cfg):
-                self.ctx.tel.etiquetas_llm += 1
-                return capitalizar(etiqueta)
-            # Un solo reintento dirigido al defecto detectado, en vez de las
-            # cuatro llamadas encadenadas del pipeline original.
-            correccion = await self._reintentar(g, etiqueta)
-            if correccion:
-                self.ctx.tel.etiquetas_llm += 1
-                return capitalizar(correccion)
-        return _fallback_etiqueta(g.titulos, g.entidades, self.ctx.tel)
-
-    async def _reintentar(self, g: GrupoEtiquetable, fallida: str) -> Optional[str]:
-        problemas = []
-        if fallida and RE_VERBO_CONJUGADO.search(unidecode(fallida.lower())):
-            problemas.append("contiene un verbo conjugado")
-        if fallida and len(fallida.split()) < self.cfg.min_palabras_subtema:
-            problemas.append("es demasiado corta")
-        if fallida and not frase_completa(fallida):
-            problemas.append("termina en preposición o artículo")
-        if fallida and normalizar_texto(fallida) in {normalizar_texto(x) for x in ETIQUETAS_GENERICAS}:
-            problemas.append("es genérica y no describe el asunto")
-        if not problemas:
-            problemas.append("no cumple el formato de frase nominal con preposición")
-
-        titulares = list(dict.fromkeys(str(t)[:130] for t in g.titulos))[:5]
-        usuario = (
-            f"Tu respuesta anterior fue \"{fallida}\" y {', '.join(problemas)}.\n\n"
-            "TITULARES:\n" + "\n".join(f"  · {t}" for t in titulares) + "\n\n"
-            "Reescribe el subtema como frase nominal de 4 a 7 palabras, empezando por "
-            "sustantivo, uniendo los conceptos con preposición y sin ningún verbo "
-            "conjugado. Debe describir el asunto concreto de estos titulares.\n\n"
-            'Responde JSON: {"subtema":"..."}'
-        )
-        datos = await chat_json_async(SISTEMA_SUBTEMA, usuario, self.ctx, max_tokens=90, temperature=0.15)
-        if not datos:
-            return None
-        etiqueta = limpiar_etiqueta(datos.get("subtema", ""), self.marca, self.aliases)
-        return etiqueta if validar_subtema(etiqueta, self.cfg) else None
-
-    async def _unificar(self, candidatas: Sequence[str], titulares: Sequence[str]) -> Optional[str]:
-        usuario = (
-            "Estos nombres describen el MISMO asunto:\n"
-            + "\n".join(f"  · {c}" for c in candidatas)
-            + "\n\nTITULARES DE REFERENCIA:\n"
-            + "\n".join(f"  · {t[:110]}" for t in list(dict.fromkeys(titulares))[:6])
-            + "\n\nElige el mejor de la lista o redacta uno nuevo que los cubra a todos: "
-            "frase nominal de 4 a 7 palabras, empezando por sustantivo, con preposición, "
-            "sin verbo conjugado y sin nombres de empresas.\n\n"
-            'Responde JSON: {"subtema":"..."}'
-        )
-        datos = await chat_json_async(SISTEMA_SUBTEMA, usuario, self.ctx, max_tokens=90)
-        if not datos:
-            return None
-        etiqueta = limpiar_etiqueta(datos.get("subtema", ""), self.marca, self.aliases)
-        return capitalizar(etiqueta) if validar_subtema(etiqueta, self.cfg) else None
-
-    async def _reformular_concreta(self, g: GrupoEtiquetable, generica: str) -> Optional[str]:
-        """Segunda oportunidad cuando la etiqueta describe al corpus entero.
-
-        No basta con pedir "sé más específico": se le devuelven las entidades
-        fuertes del grupo (las que el filtro IDF considera discriminantes) y se
-        le exige anclarse en el hecho, que es justo lo que distingue a este grupo
-        de todos los demás.
-        """
-        titulares = list(dict.fromkeys(str(t)[:130] for t in g.titulos))[:6]
-        ents = sorted(g.entidades, key=len, reverse=True)[:6]
-        usuario = (
-            f'La etiqueta "{generica}" describe igual de bien a estas noticias que '
-            "al resto del informe, así que no sirve para distinguirlas.\n\n"
-            "TITULARES:\n" + "\n".join(f"  · {t}" for t in titulares)
-            + (f"\n\nELEMENTOS DISTINTIVOS: {', '.join(ents)}" if ents else "")
-            + "\n\nEscribe un subtema que nombre el HECHO CONCRETO que comparten estas "
-            "noticias y que no encajaría en una noticia cualquiera del informe: "
-            "frase nominal de 4 a 7 palabras, empezando por sustantivo, unida con "
-            "preposición, sin verbo conjugado y sin nombres de empresas privadas.\n"
-            "Prohibido responder con categorías amplias (gestión, actualidad, "
-            "desarrollo, impacto, panorama, situación).\n\n"
-            'Responde JSON: {"subtema":"..."}'
-        )
-        datos = await chat_json_async(SISTEMA_SUBTEMA, usuario, self.ctx, max_tokens=90, temperature=0.2)
-        if not datos:
-            return None
-        etiqueta = limpiar_etiqueta(datos.get("subtema", ""), self.marca, self.aliases)
-        return capitalizar(etiqueta) if validar_subtema(etiqueta, self.cfg) else None
-
-    async def _depurar_genericas(
-        self,
-        grupos: List[GrupoEtiquetable],
-        candidatas: List[str],
-        progreso: Optional[Callable[[float, str], None]] = None,
-    ) -> List[str]:
-        """Detecta etiquetas vagas sin listas negras: por geometría.
-
-        Una etiqueta específica está mucho más cerca de su propio grupo que del
-        corpus completo. Una etiqueta genérica ("Desarrollo del sector") está a
-        una distancia parecida de todo. Comparando ambas similitudes se detectan
-        generalizaciones que ninguna lista de palabras prohibidas anticipa,
-        porque el criterio depende del corpus concreto de cada informe.
-        """
-        centros = [g.centroide for g in grupos if g.centroide is not None]
-        if len(centros) < 3 or len(set(candidatas)) < 2:
-            return candidatas
-
-        embs_lab = self.ctx.embed(list(candidatas))
-        global_c = np.mean(np.array(centros), axis=0).reshape(1, -1)
-
-        sospechosas: List[int] = []
-        for k, g in enumerate(grupos):
-            if g.centroide is None or embs_lab[k] is None:
-                continue
-            v = np.asarray(embs_lab[k], dtype=float).reshape(1, -1)
-            s_propio = float(cosine_similarity(v, np.asarray(g.centroide).reshape(1, -1))[0][0])
-            s_global = float(cosine_similarity(v, global_c)[0][0])
-            if s_propio < s_global + self.cfg.margen_especificidad:
-                sospechosas.append(k)
-
-        if not sospechosas:
-            return candidatas
-        if progreso:
-            progreso(0.45, f"Subtemas · reformulando {len(sospechosas)} etiquetas poco específicas")
-
-        nuevas = await _mapear(
-            [self._reformular_concreta(grupos[k], candidatas[k]) for k in sospechosas],
-            self.ctx.max_concurrencia,
-        )
-        salida = list(candidatas)
-        for k, propuesta in zip(sospechosas, nuevas):
-            if propuesta and normalizar_texto(propuesta) != normalizar_texto(candidatas[k]):
-                salida[k] = propuesta
-                self.ctx.tel.etiquetas_reformuladas_genericas += 1
-        return salida
-
-    async def etiquetar(
-        self,
-        grupos: List[GrupoEtiquetable],
-        textos: Sequence[str],
-        idx_ents: IndiceEntidades,
-        progreso: Optional[Callable[[float, str], None]] = None,
-    ) -> Dict[int, str]:
-        if not grupos:
-            return {}
-
-        # ── Ronda A · en paralelo, sin contexto cruzado ─────────────────────
-        if progreso:
-            progreso(0.10, f"Subtemas · etiquetando {len(grupos)} grupos en paralelo")
-        candidatas = await _mapear(
-            [self._etiquetar_grupo(g, []) for g in grupos], self.ctx.max_concurrencia
-        )
-
-        # ── Prueba de especificidad · antes de consolidar ───────────────────
-        # Se hace aquí y no al final: una etiqueta vaga arrastra a su familia
-        # entera durante la unificación y contamina el tema que se derive de ella.
-        candidatas = await self._depurar_genericas(grupos, list(candidatas), progreso)
-
-        # ── Consolidación · qué etiquetas nombran lo mismo ──────────────────
-        if progreso:
-            progreso(0.55, "Subtemas · consolidando etiquetas equivalentes")
-
-        unicas = list(dict.fromkeys(candidatas))
-        mapa_final: Dict[str, str] = {u: u for u in unicas}
-
-        if len(unicas) > 1:
-            embs_lab = self.ctx.embed(list(unicas))
-            validos = [k for k, e in enumerate(embs_lab) if e is not None]
-            if len(validos) >= 2:
-                M = np.array([embs_lab[k] for k in validos])
-                sim = cosine_similarity(M)
-                dsu = DSUPrecision(len(unicas))
-
-                grupos_por_etiqueta: Dict[str, List[GrupoEtiquetable]] = defaultdict(list)
-                for g, c in zip(grupos, candidatas):
-                    grupos_por_etiqueta[c].append(g)
-                frecuencia = Counter(candidatas)
-
-                for a in range(len(validos)):
-                    for b in range(a + 1, len(validos)):
-                        s = float(sim[a][b])
-                        if s < self.cfg.sim_unificar_etiquetas:
-                            continue
-                        ea, eb = unicas[validos[a]], unicas[validos[b]]
-                        if dsu.find(validos[a]) == dsu.find(validos[b]):
-                            continue
-                        if hay_conflicto_accion(ea, eb):
-                            self.ctx.tel.uniones_rechazadas_conflicto += 1
-                            continue
-                        # Dos etiquetas parecidas no bastan: se comprueba que el
-                        # CONTENIDO que cubren también lo sea. "Inversión en vías"
-                        # e "Inversión en salud" puntúan 0.91 como cadenas.
-                        if self._contenidos_compatibles(
-                            grupos_por_etiqueta[ea], grupos_por_etiqueta[eb], idx_ents
-                        ):
-                            dsu.union(validos[a], validos[b])
-
-                for miembros in sorted(dsu.grupos().values(), key=lambda ms: (len(ms), ms[0])):
-                    if len(miembros) < 2:
-                        continue
-                    familia = [unicas[m] for m in miembros]
-                    titulares = []
-                    for e in familia:
-                        for g in grupos_por_etiqueta[e]:
-                            titulares.extend(g.titulos[:3])
-                    canonica = max(familia, key=lambda x: (frecuencia[x], len(x)))
-                    if len(familia) <= 4:
-                        propuesta = await self._unificar(familia, titulares)
-                        if propuesta:
-                            canonica = propuesta
-                    for e in familia:
-                        mapa_final[e] = canonica
-                    self.ctx.tel.etiquetas_unificadas += len(familia) - 1
-
-        if progreso:
-            progreso(0.95, "Subtemas listos")
-        return {g.id_grupo: capitalizar(mapa_final.get(c, c)) for g, c in zip(grupos, candidatas)}
-
-    def _contenidos_compatibles(
-        self,
-        grupos_a: List[GrupoEtiquetable],
-        grupos_b: List[GrupoEtiquetable],
-        idx_ents: IndiceEntidades,
-    ) -> bool:
-        if not grupos_a or not grupos_b:
-            return False
-        ca = [g.centroide for g in grupos_a if g.centroide is not None]
-        cb = [g.centroide for g in grupos_b if g.centroide is not None]
-        if not ca or not cb:
-            return False
-        sim = float(
-            cosine_similarity(
-                np.mean(ca, axis=0).reshape(1, -1), np.mean(cb, axis=0).reshape(1, -1)
-            )[0][0]
-        )
-        if sim < self.cfg.sim_asunto:
-            return False
-        ents_a: set = set()
-        ents_b: set = set()
-        for g in grupos_a:
-            ents_a |= g.entidades
-        for g in grupos_b:
-            ents_b |= g.entidades
-        txt_a = " ".join(t for g in grupos_a for t in g.titulos[:8])
-        txt_b = " ".join(t for g in grupos_b for t in g.titulos[:8])
-        return jaccard(ents_a, ents_b) >= self.cfg.jaccard_entidades_min or (
-            overlap_distintivo(txt_a, txt_b) >= self.cfg.overlap_tokens_min
-        )
-
-
-# ==============================================================================
-# 9 · TEMAS
-# ==============================================================================
-
-SISTEMA_TEMA = (
-    "Eres editor jefe de un diario y construyes la taxonomía de secciones de un "
-    "informe de medios. Respondes únicamente con JSON válido."
-)
-
-
-async def _nombrar_tema(
-    subtemas: Sequence[str],
-    titulares: Sequence[str],
-    ctx: EngineContext,
-    cfg: ConfigPrecision,
-    marca: str,
-    aliases: Sequence[str],
-) -> Optional[str]:
-    palabras = []
-    for t in list(titulares)[:15]:
-        for w in normalizar_texto(t).split():
-            if len(w) > 3 and w not in TOKENS_DEBILES:
-                palabras.append(w)
-    kw = ", ".join(w for w, _ in Counter(palabras).most_common(6))
-
-    usuario = (
-        "SUBTEMAS A AGRUPAR:\n" + "\n".join(f"  · {s}" for s in list(subtemas)[:10])
-        + "\n\nTITULARES DE REFERENCIA:\n"
-        + "\n".join(f"  · {t[:100]}" for t in list(dict.fromkeys(titulares))[:5])
-        + f"\n\nPALABRAS CLAVE: {kw}\n\n"
-        "Escribe el TEMA: categoría editorial de 2 a 4 palabras que englobe esos subtemas.\n\n"
-        "REGLAS\n"
-        "- Más general que los subtemas, pero sin perder el asunto que los une.\n"
-        "- Prohibidas las secciones vagas de una palabra (Economía, Política, Actualidad).\n"
-        "- Sin números, cantidades ni nombres propios de personas o empresas.\n"
-        "- Sustantivo + complemento o adjetivo. Sin verbo conjugado. Con tildes y ñ.\n"
-        "- No copies literalmente ninguno de los subtemas.\n\n"
-        "EJEMPLOS\n"
-        '  OK  "Infraestructura vial"   "Regulación financiera"\n'
-        '  OK  "Movilidad urbana"       "Salud pública territorial"\n'
-        '  MAL "Economía"               (sección vaga)\n'
-        '  MAL "Nuevo acuerdo firmado"  (titular)\n\n'
-        'Responde JSON: {"tema":"..."}'
-    )
-    datos = await chat_json_async(SISTEMA_TEMA, usuario, ctx, max_tokens=60)
-    if not datos:
-        return None
-    tema = limpiar_etiqueta(datos.get("tema", ""), marca, aliases)
-    tema = recortar_frase(tema, max_palabras=cfg.max_palabras_tema)
-    return capitalizar(tema) if validar_tema(tema, cfg) else None
-
-
-def _tema_igual_a_subtema(tema: str, subtemas: Sequence[str]) -> bool:
-    tn = normalizar_texto(tema)
-    if not tn:
-        return True
-    for s in subtemas:
-        sn = normalizar_texto(s)
-        if not sn:
-            continue
-        if SequenceMatcher(None, tn, sn).ratio() >= 0.82:
-            return True
-        if tn in sn or sn in tn:
-            return True
-    return False
-
-
-async def construir_temas(
-    subtemas: List[str],
-    textos: Sequence[str],
-    embs: List[Optional[List[float]]],
-    idx_ents: IndiceEntidades,
-    ctx: EngineContext,
-    cfg: ConfigPrecision,
-    marca: str,
-    aliases: Sequence[str],
-    num_temas_max: Optional[int] = None,
-    progreso: Optional[Callable[[float, str], None]] = None,
-) -> List[str]:
-    """NIVEL 2 · agrupa subtemas afines bajo una categoría editorial.
-
-    Garantía estructural: cada subtema pertenece a exactamente un tema. En el
-    original el tema se decidía por noticia y luego se reconciliaba por voto,
-    de modo que dos noticias con el mismo subtema podían acabar en temas
-    distintos según el orden de las fases de validación.
-    """
-    unicos = list(dict.fromkeys(subtemas))
-    if len(unicos) <= 1:
-        return [capitalizar(s) for s in subtemas]
-
-    if progreso:
-        progreso(0.05, f"Temas · agrupando {len(unicos)} subtemas")
-
-    indices_por_sub: Dict[str, List[int]] = defaultdict(list)
-    for i, s in enumerate(subtemas):
-        indices_por_sub[s].append(i)
-
-    # Representación de cada subtema: etiqueta + centroide de su contenido.
-    centroides: Dict[str, np.ndarray] = {}
-    for s in unicos:
-        vecs = [embs[i] for i in indices_por_sub[s][:50] if embs[i] is not None]
-        if vecs:
-            centroides[s] = np.mean(vecs, axis=0)
-
-    embs_lab = ctx.embed(list(unicos))
-    validos = [s for s in unicos if s in centroides]
-    if len(validos) < 2:
-        return [capitalizar(s) for s in subtemas]
-
-    pos_lab = {s: k for k, s in enumerate(unicos)}
-    M_cont = np.array([centroides[s] for s in validos])
-    sim = cosine_similarity(M_cont)
-
-    if all(embs_lab[pos_lab[s]] is not None for s in validos):
-        M_lab = np.array([embs_lab[pos_lab[s]] for s in validos])
-        # El contenido manda; la etiqueta solo matiza. Al revés, dos subtemas con
-        # nombres parecidos y contenidos distintos acabarían en el mismo tema.
-        sim = 0.70 * sim + 0.30 * cosine_similarity(M_lab)
-
-    np.fill_diagonal(sim, 1.0)
-    dist = np.clip(1.0 - sim, 0.0, 2.0)
-    np.fill_diagonal(dist, 0.0)
-
-    if progreso:
-        progreso(0.25, "Temas · clustering")
-
-    etiquetas = AgglomerativeClustering(
-        n_clusters=None,
-        distance_threshold=1.0 - cfg.sim_tema,
-        metric="precomputed",
-        linkage="average",
-    ).fit(dist).labels_
-
-    provisional: Dict[int, List[int]] = defaultdict(list)
-    for k, lbl in enumerate(etiquetas):
-        provisional[lbl].append(k)
-
-    dsu = DSUPrecision(len(validos))
-    textos_rep = {s: " ".join(str(textos[i])[:250] for i in indices_por_sub[s][:8]) for s in validos}
-    ents_por_sub = {
-        s: set().union(*[idx_ents.fuertes[i] for i in indices_por_sub[s][:15]]) if indices_por_sub[s] else set()
-        for s in validos
-    }
-
-    for miembros in provisional.values():
-        if len(miembros) < 2:
-            continue
-        for a in range(len(miembros)):
-            for b in range(a + 1, len(miembros)):
-                ka, kb = miembros[a], miembros[b]
-                sa, sb = validos[ka], validos[kb]
-                s_val = float(sim[ka][kb])
-                if s_val < cfg.piso_absoluto_tema:
-                    continue
-                if hay_conflicto_accion(f"{sa} {textos_rep[sa]}", f"{sb} {textos_rep[sb]}"):
-                    ctx.tel.uniones_rechazadas_conflicto += 1
-                    continue
-                ov = overlap_distintivo(f"{sa} {textos_rep[sa]}", f"{sb} {textos_rep[sb]}")
-                jac = jaccard(ents_por_sub[sa], ents_por_sub[sb])
-                if s_val >= cfg.sim_tema and (ov >= cfg.overlap_tokens_min_tema or jac >= 0.20):
-                    dsu.union(ka, kb)
-                else:
-                    ctx.tel.uniones_rechazadas_overlap += 1
-
-    familias: Dict[int, List[str]] = defaultdict(list)
-    for k, s in enumerate(validos):
-        familias[dsu.find(k)].append(s)
-
-    # `num_temas_max` era un parámetro fantasma en el original: se calculaba y se
-    # mostraba en pantalla, pero el clustering usaba distance_threshold y nunca
-    # lo aplicaba. Aquí se aplica de verdad, fusionando solo los pares más
-    # similares y nunca por debajo del piso: el tope no puede forzar una fusión
-    # falsa.
-    if num_temas_max and len(familias) > num_temas_max:
-        fusionadas = _reducir_familias(familias, validos, sim, cfg, num_temas_max, ctx.tel)
-        familias = fusionadas
-
-    if progreso:
-        progreso(0.45, f"Temas · nombrando {len(familias)} categorías")
-
-    claves = list(familias.keys())
-    coros = []
-    for clave in claves:
-        subs = familias[clave]
-        titulares = []
-        for s in subs:
-            for i in indices_por_sub[s][:6]:
-                titulares.append(str(textos[i]).split(". ")[0][:120])
-        coros.append(_nombrar_tema(subs, titulares, ctx, cfg, marca, aliases))
-    nombres = await _mapear(coros, ctx.max_concurrencia)
-
-    sub_a_tema: Dict[str, str] = {}
-    usados: set = set()
-    for clave, nombre in zip(claves, nombres):
-        subs = familias[clave]
-        if not nombre or _tema_igual_a_subtema(nombre, subs) or normalizar_texto(nombre) in usados:
-            nombre = _tema_fallback(subs, ctx.tel)
-        usados.add(normalizar_texto(nombre))
-        for s in subs:
-            sub_a_tema[s] = nombre
-
-    # Subtemas sin embedding válido: tema propio derivado de su propio nombre.
-    for s in unicos:
-        if s not in sub_a_tema:
-            sub_a_tema[s] = capitalizar(recortar_frase(s, max_palabras=cfg.max_palabras_tema) or s)
-
-    if progreso:
-        progreso(1.0, "Temas listos")
-    return [sub_a_tema[s] for s in subtemas]
-
-
-def _reducir_familias(
-    familias: Dict[int, List[str]],
-    validos: List[str],
-    sim: np.ndarray,
-    cfg: ConfigPrecision,
-    tope: int,
-    tel: Telemetria,
-) -> Dict[int, List[str]]:
-    pos = {s: k for k, s in enumerate(validos)}
-    actuales = {k: list(v) for k, v in familias.items()}
-
-    while len(actuales) > tope:
-        mejor: Optional[Tuple[float, Any, Any]] = None
-        claves = list(actuales.keys())
-        for a in range(len(claves)):
-            for b in range(a + 1, len(claves)):
-                ia = [pos[s] for s in actuales[claves[a]]]
-                ib = [pos[s] for s in actuales[claves[b]]]
-                s_val = float(np.mean(sim[np.ix_(ia, ib)]))
-                if mejor is None or s_val > mejor[0]:
-                    mejor = (s_val, claves[a], claves[b])
-        if mejor is None or mejor[0] < cfg.piso_absoluto_tema:
-            tel.avisar(
-                f"Se alcanzó el tope de {tope} temas pero quedaron {len(actuales)}: "
-                "fusionar más habría unido categorías no relacionadas."
-            )
-            break
-        _, ka, kb = mejor
-        actuales[ka].extend(actuales[kb])
-        del actuales[kb]
-
-    return actuales
-
-
-def _tema_fallback(subtemas: Sequence[str], tel: Telemetria) -> str:
-    tel.etiquetas_fallback += 1
-    palabras = []
-    for s in subtemas:
-        for w in normalizar_texto(s).split():
-            if len(w) > 3 and w not in TOKENS_DEBILES:
-                palabras.append(w)
-    top = [w for w, _ in Counter(palabras).most_common(2)]
-    if len(top) >= 2:
-        return capitalizar(f"{top[0]} y {top[1]}")
-    if top:
-        return capitalizar(top[0])
-    return "Cobertura general"
-
-
-# ==============================================================================
-# 10 · COHERENCIA Y ARMONIZACIÓN
-# ==============================================================================
-
-def reasignar_por_coherencia(
-    subtemas: List[str],
-    embs: List[Optional[List[float]]],
-    id_asunto: List[int],
-    cfg: ConfigPrecision,
-    tel: Telemetria,
-) -> List[str]:
-    """Mueve un ASUNTO COMPLETO a otro subtema solo si la mejora es clara.
-
-    La unidad de reasignación es el asunto, no la noticia suelta. Mover notas
-    individuales rompía justo la garantía que persigue el motor: dos noticias del
-    mismo hecho podían acabar en subtemas distintos porque una de ellas quedaba
-    marginalmente más cerca del centroide vecino. Se compara el centroide del
-    asunto contra los centroides de subtema y se exige margen y mínimo absoluto.
-    """
-    n = len(subtemas)
-    unicos = list(dict.fromkeys(subtemas))
-    if len(unicos) < 2:
-        return subtemas
-
-    centroides = {}
-    for s in unicos:
-        vecs = [embs[i] for i in range(n) if subtemas[i] == s and embs[i] is not None]
-        if vecs:
-            centroides[s] = np.mean(vecs, axis=0)
-    subs_validos = [s for s in unicos if s in centroides]
-    if len(subs_validos) < 2:
-        return subtemas
-
-    por_asunto: Dict[int, List[int]] = defaultdict(list)
-    for i, g in enumerate(id_asunto):
-        por_asunto[g].append(i)
-
-    # Centroide de cada asunto: un asunto sin ningún embedding no se toca.
-    asuntos: List[int] = []
-    vec_asunto: List[np.ndarray] = []
-    for g in sorted(por_asunto.keys()):
-        vecs = [embs[i] for i in por_asunto[g] if embs[i] is not None]
-        if not vecs:
-            continue
-        asuntos.append(g)
-        vec_asunto.append(np.mean(vecs, axis=0))
-    if not asuntos:
-        return subtemas
-
-    sim = cosine_similarity(np.array(vec_asunto), np.array([centroides[s] for s in subs_validos]))
-    pos_sub = {s: k for k, s in enumerate(subs_validos)}
-
-    salida = list(subtemas)
-    MARGEN = 0.06        # la alternativa debe ganar por un margen real
-    MINIMO = 0.62        # y superar un mínimo absoluto de pertenencia
-
-    for fila, g in enumerate(asuntos):
-        idxs = por_asunto[g]
-        actual = Counter(subtemas[i] for i in idxs).most_common(1)[0][0]
-        if actual not in pos_sub:
-            continue
-        s_actual = float(sim[fila][pos_sub[actual]])
-        mejor_k = int(np.argmax(sim[fila]))
-        destino = subs_validos[mejor_k]
-        if destino == actual:
-            continue
-        s_mejor = float(sim[fila][mejor_k])
-        if s_mejor >= MINIMO and s_mejor >= s_actual + MARGEN:
-            for i in idxs:
-                salida[i] = destino
-            tel.subtemas_reasignados_coherencia += 1
-
-    return armonizar(salida, id_asunto)
-
-
-def armonizar_tono(
-    tonos: List[str],
-    confianzas: List[float],
-    grupos: List[int],
-    menciona: List[bool],
-    tel: Telemetria,
-) -> Tuple[List[str], List[float]]:
-    """Unifica el tono dentro de cada asunto, ponderando por confianza.
-
-    Un voto mayoritario simple no sirve aquí: las notas sin mención literal de la
-    marca son Neutro por construcción y, al ser mayoría, arrastrarían a Neutro un
-    asunto claramente negativo. Solo votan las notas que nombran la marca, con
-    peso igual a su confianza. Si nadie la nombra, o hay empate, se queda Neutro:
-    ante la duda, el tono más conservador.
-    """
-    por_grupo: Dict[int, List[int]] = defaultdict(list)
-    for i, g in enumerate(grupos):
-        por_grupo[g].append(i)
-
-    salida = list(tonos)
-    salida_conf = list(confianzas)
-    for g in sorted(por_grupo.keys()):
-        idxs = por_grupo[g]
-        if len(idxs) < 2:
-            continue
-        votos: Dict[str, float] = defaultdict(float)
-        for i in idxs:
-            if not menciona[i]:
-                continue
-            votos[tonos[i]] += max(float(confianzas[i]), 0.01)
-        if not votos:
-            continue
-        mejor = max(votos.values())
-        empatados = sorted(t for t, v in votos.items() if abs(v - mejor) < 1e-9)
-        ganador = "Neutro" if len(empatados) > 1 else empatados[0]
-        if any(tonos[i] != ganador for i in idxs if menciona[i]):
-            tel.tono_armonizado_por_asunto += 1
-        for i in idxs:
-            # Una nota que no nombra la marca sigue siendo Neutro: no hereda el
-            # tono del asunto solo por pertenecer a él.
-            if not menciona[i]:
-                salida[i], salida_conf[i] = "Neutro", 1.0
-            else:
-                salida[i] = ganador
-                salida_conf[i] = max(salida_conf[i], 0.0)
-    return salida, salida_conf
-
-
-def armonizar(valores: List[str], grupos: List[int]) -> List[str]:
-    """Fuerza un único valor por grupo (voto mayoritario, desempate por frecuencia global).
-
-    Esta es la garantía que pedía el flujo: si dos noticias son la misma noticia,
-    su tono, tema y subtema deben coincidir, pase lo que pase en las fases
-    intermedias.
-    """
-    por_grupo: Dict[int, List[int]] = defaultdict(list)
-    for i, g in enumerate(grupos):
-        por_grupo[g].append(i)
-    global_freq = Counter(valores)
-    salida = list(valores)
-    for idxs in por_grupo.values():
-        if len(idxs) < 2:
-            continue
-        conteo = Counter(valores[i] for i in idxs)
-        ganador = max(conteo.items(), key=lambda kv: (kv[1], global_freq[kv[0]], len(kv[0])))[0]
-        for i in idxs:
-            salida[i] = ganador
-    return salida
-
-
-# ==============================================================================
-# 11 · ORQUESTADOR
-# ==============================================================================
-
-async def analizar_corpus(
-    titulos: Sequence[str],
-    resumenes: Sequence[str],
-    marca: str,
-    aliases: Sequence[str],
-    ctx: EngineContext,
-    cfg: Optional[ConfigPrecision] = None,
-    progreso: Optional[Callable[[float, str], None]] = None,
-    calcular_tono: bool = True,
-    calcular_subtemas: bool = True,
-    calcular_temas: bool = True,
-    num_temas_max: Optional[int] = None,
-) -> ResultadoAnalisis:
-    """Punto de entrada único del motor."""
-    titulos = [str(t or "") for t in titulos]
-    resumenes = [str(r if r is not None and str(r).lower() != "nan" else "") for r in resumenes]
-    n = len(titulos)
-    tel = ctx.tel
-
-    if n == 0:
-        return ResultadoAnalisis([], [], [], [], [], [], tel)
-
-    cfg = (cfg or ConfigPrecision()).escalar_por_corpus(n)
-
-    def _p(frac: float, msg: str) -> None:
-        if progreso:
-            progreso(min(max(frac, 0.0), 1.0), msg)
-
-    # ── Embeddings y señales léxicas ────────────────────────────────────────
-    _p(0.02, "Preparando representaciones...")
-    textos_emb = [_pe_texto_para_embedding(titulos[i], resumenes[i]) for i in range(n)]
-    embs = ctx.embed(textos_emb)
-    if sum(1 for e in embs if e is None) > n * 0.2:
-        tel.avisar(
-            "Más del 20% de los embeddings falló: la agrupación será conservadora "
-            "y muchas noticias quedarán sin agrupar."
-        )
-
-    entidades = [extraer_entidades(titulos[i], resumenes[i]) for i in range(n)]
-    idx_ents = IndiceEntidades(entidades, cfg)
-
-    # ── NIVEL 0 · identidad ─────────────────────────────────────────────────
-    _p(0.08, "Nivel 0 · detectando republicaciones...")
-    id_identidad = construir_identidad(titulos, resumenes, textos_emb, embs, idx_ents, cfg, tel)
-
-    # ── NIVEL 1 · asunto ────────────────────────────────────────────────────
-    _p(0.14, "Nivel 1 · agrupando noticias del mismo hecho...")
-    id_asunto = construir_asunto(textos_emb, embs, id_identidad, idx_ents, cfg, tel)
-
-    n_ident = len(set(id_identidad))
-    n_asunto = len(set(id_asunto))
-    _p(0.18, f"{n} noticias · {n_ident} únicas · {n_asunto} asuntos")
-
-    # ── Tono ────────────────────────────────────────────────────────────────
-    tonos = ["N/A"] * n
-    confianzas = [0.0] * n
-    if calcular_tono:
-        motor = MotorTono(marca, aliases, ctx, cfg)
-        tonos, confianzas = await motor.procesar(
-            titulos, resumenes, id_identidad, embs,
-            progreso=lambda f, m: _p(0.20 + 0.25 * f, m),
-        )
-        # El tono se unifica en los dos niveles: primero la republicación exacta,
-        # después el hecho completo. Sin el segundo paso, dos coberturas del mismo
-        # hecho podían salir con tonos opuestos por haberse clasificado aparte.
-        tonos = armonizar(tonos, id_identidad)
-        menciona = [motor.detector.menciona(f"{titulos[i]} {resumenes[i]}") for i in range(n)]
-        tonos, confianzas = armonizar_tono(tonos, confianzas, id_asunto, menciona, tel)
-
-    # ── Subtemas ────────────────────────────────────────────────────────────
-    subtemas = ["N/A"] * n
-    if calcular_subtemas:
-        _p(0.46, "Construyendo subtemas...")
-        grupos: List[GrupoEtiquetable] = []
-        por_asunto: Dict[int, List[int]] = defaultdict(list)
-        for i, g in enumerate(id_asunto):
-            por_asunto[g].append(i)
-
-        # UN grupo por asunto, sin trocear. Trocear un asunto grande hacía que
-        # cada trozo se etiquetara por separado y noticias del mismo hecho
-        # acabaran con subtemas distintos. En su lugar se ordena el grupo por
-        # representatividad: el prompt solo lee las primeras noticias, así que
-        # basta con que las primeras sean las más centrales y las más completas.
-        for g, idxs in sorted(por_asunto.items(), key=lambda kv: (-len(kv[1]), kv[0])):
-            vecs = [embs[i] for i in idxs if embs[i] is not None]
-            centroide = np.mean(vecs, axis=0) if vecs else None
-            orden = _ordenar_por_representatividad(idxs, embs, centroide, resumenes)
-            ents: set = set()
-            for i in orden[:20]:
-                ents |= idx_ents.fuertes[i]
-            grupos.append(
-                GrupoEtiquetable(
-                    id_grupo=g,
-                    indices=idxs,
-                    titulos=[titulos[i] for i in orden],
-                    resumenes=[resumenes[i] for i in orden],
-                    entidades=ents,
-                    centroide=centroide,
-                )
-            )
-
-        etiquetador = EtiquetadorSubtemas(marca, aliases, ctx, cfg)
-        mapa = await etiquetador.etiquetar(
-            grupos, textos_emb, idx_ents,
-            progreso=lambda f, m: _p(0.46 + 0.28 * f, m),
-        )
-        subtemas = ["Sin clasificar"] * n
-        for g in grupos:
-            etiqueta = mapa.get(g.id_grupo, "Sin clasificar")
-            for i in g.indices:
-                subtemas[i] = etiqueta
-
-        _p(0.76, "Verificando coherencia noticia ↔ subtema...")
-        subtemas = reasignar_por_coherencia(subtemas, embs, id_asunto, cfg, tel)
-        # Doble red: primero el hecho, luego la republicación. Tras esto es
-        # imposible que dos noticias del mismo asunto tengan subtemas distintos.
-        subtemas = armonizar(subtemas, id_asunto)
-        subtemas = armonizar(subtemas, id_identidad)
-
-    # ── Temas ───────────────────────────────────────────────────────────────
-    temas = ["N/A"] * n
-    if calcular_temas and calcular_subtemas:
-        _p(0.80, "Construyendo temas...")
-        temas = await construir_temas(
-            subtemas, textos_emb, embs, idx_ents, ctx, cfg, marca, aliases,
-            num_temas_max=num_temas_max,
-            progreso=lambda f, m: _p(0.80 + 0.18 * f, m),
-        )
-        # La jerarquía es estricta: el tema depende del subtema, nunca al revés.
-        sub_a_tema: Dict[str, str] = {}
-        for s, t in zip(subtemas, temas):
-            sub_a_tema.setdefault(s, t)
-        temas = [sub_a_tema[s] for s in subtemas]
-        temas = armonizar(temas, id_asunto)
-        temas = armonizar(temas, id_identidad)
-
-    if tel.tasa_fallo_llm > 0.10:
-        tel.avisar(
-            f"El {tel.tasa_fallo_llm * 100:.0f}% de las llamadas al modelo falló. "
-            "Revisa la clave de API y los límites de cuota antes de dar por buenos "
-            "estos resultados."
-        )
-
-    _p(1.0, "Análisis completado")
-    return ResultadoAnalisis(
-        tonos=tonos,
-        confianza_tono=confianzas,
-        subtemas=subtemas,
-        temas=temas,
-        id_identidad=id_identidad,
-        id_asunto=id_asunto,
-        telemetria=tel,
-    )
-
-# ============ FIN DEL MOTOR DE PRECISIÓN ============
-
-
-# ======================================
-# Puente con el motor de precisión
-# ======================================
-def motor_precision_activo() -> bool:
-    return bool(USAR_MOTOR_PRECISION and MOTOR_PRECISION_DISPONIBLE)
-
-
-def _contexto_motor():
-    """Inyecta en el motor las funciones de la app (embeddings y contador de costos).
-
-    El motor no importa Streamlit: recibe aquí el acceso al caché de embeddings y
-    al acumulador de tokens, de modo que el costo mostrado en pantalla sigue
-    siendo el real y el caché se comparte con el resto del pipeline.
-    """
-    def _contar(tin: int, tout: int) -> None:
-        st.session_state['tokens_input']  += tin
-        st.session_state['tokens_output'] += tout
-
-    return EngineContext(
-        embed=get_embeddings_batch,
-        modelo=OPENAI_MODEL_CLASIFICACION,
-        on_tokens=_contar,
-        max_concurrencia=CONCURRENT_REQUESTS,
-        seed=7,
-    )
-
-
-async def analizar_con_motor(titulos, resumenes, bn, ba, pb=None,
-                             calcular_tono=True, calcular_subtemas=True,
-                             calcular_temas=True, num_temas_max=None):
-    """Ejecuta el motor y deja la telemetría en sesión para el panel de calidad."""
-    for k in ('telemetria_motor', 'avisos_motor', 'grupos_motor'):
-        st.session_state.pop(k, None)
-    ctx = _contexto_motor()
-
-    def _progreso(frac, msg):
-        if pb is not None:
-            try:
-                pb.progress(min(max(float(frac), 0.0), 1.0), text=str(msg)[:110])
-            except Exception:
-                pass
-
-    resultado = await analizar_corpus(
-        titulos=list(titulos),
-        resumenes=list(resumenes),
-        marca=bn,
-        aliases=list(ba or []),
-        ctx=ctx,
-        progreso=_progreso,
-        calcular_tono=calcular_tono,
-        calcular_subtemas=calcular_subtemas,
-        calcular_temas=calcular_temas,
-        num_temas_max=num_temas_max,
-    )
-    st.session_state['telemetria_motor'] = resultado.telemetria.resumen()
-    st.session_state['avisos_motor']     = list(resultado.telemetria.avisos)
-    st.session_state['grupos_motor']     = {
-        "noticias": len(resultado.tonos) or len(resultado.subtemas),
-        "identidades": len(set(resultado.id_identidad)),
-        "asuntos": len(set(resultado.id_asunto)),
-        "subtemas": len({s for s in resultado.subtemas if s not in ("N/A",)}),
-        "temas": len({t for t in resultado.temas if t not in ("N/A",)}),
-    }
-    return resultado
-
-
-def render_panel_calidad():
-    """Panel de diagnóstico: sin esto no hay forma de saber si un informe lleno
-    de 'Neutro' refleja la realidad o una tanda de errores de API."""
-    tel = st.session_state.get('telemetria_motor')
-    if not tel:
-        return
-    for aviso in st.session_state.get('avisos_motor', []):
-        st.warning(aviso)
-
-    # Un embedding perdido significa una noticia que no pudo agruparse con nadie:
-    # es un hueco en la clasificación, no un detalle técnico que ocultar.
-    fallidos = st.session_state.get('embeddings_fallidos', 0)
-    if fallidos:
-        detalle = "; ".join(st.session_state.get('embeddings_errores', [])[:3])
-        st.warning(
-            f"{fallidos} noticia(s) se quedaron sin embedding y pudieron no agruparse "
-            f"con sus similares. Primeros errores: {detalle}"
-        )
-    g = st.session_state.get('grupos_motor', {})
-    if g:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Noticias", g.get("noticias", 0))
-        c2.metric("Noticias únicas", g.get("identidades", 0),
-                  help="Grupos de identidad: republicaciones de la misma noticia.")
-        c3.metric("Asuntos", g.get("asuntos", 0),
-                  help="Noticias distintas que cubren el mismo hecho.")
-        c4.metric("Temas", g.get("temas", 0))
-    with st.expander("Diagnóstico de calidad del análisis"):
-        filas = [{"Indicador": k, "Valor": v} for k, v in tel.items()]
-        st.dataframe(pd.DataFrame(filas), use_container_width=True, hide_index=True)
-
-
 # ======================================
 # Proceso principal
 # ======================================
 async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=None, cliente="", voceros="", enable_scraping=False):
     st.session_state.update({'tokens_input': 0, 'tokens_output': 0, 'tokens_embedding': 0})
-    for _k in ('telemetria_motor', 'avisos_motor', 'grupos_motor',
-               'embeddings_fallidos', 'embeddings_lotes_fallidos', 'embeddings_errores'):
-        st.session_state.pop(_k, None)
     get_embedding_cache().clear()
     t0 = time.time()
     
@@ -4957,11 +2702,8 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
         try:
             openai.api_key=st.secrets["OPENAI_API_KEY"]
             openai.aiosession.set(None)
-        except (KeyError, FileNotFoundError):
-            st.error("OPENAI_API_KEY no encontrado en st.secrets.")
-            st.stop()
-        except Exception as e:
-            st.error(f"No se pudo inicializar el cliente de OpenAI: {type(e).__name__}: {e}")
+        except:
+            st.error("OPENAI_API_KEY no encontrado.")
             st.stop()
             
     with st.status("Paso 1 · Carga de Configuración y Dossier", expanded=True) as s:
@@ -5016,6 +2758,7 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
             "tonoiai": "Tono IA",
             "tema": "Tema",
             "subtema": "Subtema",
+            "idhistoria": "ID Historia",
             "link_nota": "Link Nota",
             "resumen": "Resumen - Aclaracion",
             "link_streaming": "Link (Streaming - Imagen)",
@@ -5024,11 +2767,6 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
         }
         
         rows = detectar_duplicados_avanzado(rows_expanded, km)
-        for row in rows:
-            if row["is_duplicate"]:
-                row["Tono IA"] = "Duplicada"
-                row["Tema"] = "-"
-                row["Subtema"] = "-"
                 
         s.update(label="✓ Paso 1 completado", state="complete")
         
@@ -5044,68 +2782,67 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
             lambda r: texto_para_embedding(str(r.get(km["titulo"], "")), str(r.get(km["resumen"], ""))),
             axis=1
         )
+        def _url_fila(r):
+            value = r.get(km["link_nota"], "")
+            return value.get("url", "") if isinstance(value, dict) else str(value or "")
+        story_clusters = construir_story_clusters(
+            df[km["resumen"]].fillna("").tolist(),
+            df[km["titulo"]].fillna("").tolist(),
+            [_url_fila(r) for _, r in df.iterrows()],
+        )
+        df[km["idhistoria"]] = story_clusters
         with st.status("Embeddings...", expanded=True) as s:
             _ = get_embeddings_batch(df["_txt"].tolist())
             s.update(label=f"✓ {get_embedding_cache().stats()}", state="complete")
-
-        titulos_l   = df[km["titulo"]].fillna('').astype(str).tolist()
-        resumenes_l = df[km["resumen"]].fillna('').astype(str).tolist()
-        usar_motor  = motor_precision_activo() and "Solo Modelos PKL" not in mode and not tpkl and not epkl
-
-        if usar_motor:
-            # Ruta unificada: tono, subtema y tema salen de la MISMA jerarquía de
-            # grupos, así dos noticias iguales no pueden recibir valores distintos.
-            with st.status("Paso 3-4 · Análisis de precisión", expanded=True) as s:
-                pb = st.progress(0)
-                if "API" in mode or "Híbrido" in mode:
-                    resultado = await analizar_con_motor(
-                        titulos_l, resumenes_l, bn, ba, pb, num_temas_max=15
-                    )
-                    df[km["tonoiai"]] = resultado.tonos
-                    df[km["subtema"]] = resultado.subtemas
-                    df[km["tema"]]    = resultado.temas
-                else:
-                    df[km["tonoiai"]] = ["N/A"] * len(ta)
-                    df[km["subtema"]] = ["N/A"] * len(ta)
-                    df[km["tema"]]    = ["N/A"] * len(ta)
-                s.update(label="✓ Paso 3-4 · Tono, subtema y tema coherentes", state="complete")
-        else:
-            with st.status("Paso 3 · Tono (Reputación)", expanded=True) as s:
-                pb = st.progress(0)
-                if ("PKL" in mode or tpkl) and tpkl:
-                    res = analizar_tono_con_pkl(df["_txt"].tolist(), tpkl)
-                    if res is None: st.stop()
-                elif "API" in mode or "Híbrido" in mode:
-                    res = await ClasificadorTono(bn, ba).procesar_lote_async(
-                        df["_txt"], pb, df[km["resumen"]], df[km["titulo"]]
-                    )
-                else:
-                    res = [{"tono": "N/A"}] * len(ta)
-                df[km["tonoiai"]] = [r["tono"] for r in res]
-                s.update(label="✓ Paso 3 · Tono (Reputación)", state="complete")
-
-            with st.status("Paso 4 · Clasificación", expanded=True) as s:
-                pb = st.progress(0)
-                if "Solo Modelos PKL" in mode:
-                    subtemas = ["N/A"] * len(ta)
-                    temas    = ["N/A"] * len(ta)
-                else:
-                    subtemas = ClasificadorSubtema(bn, ba).procesar_lote(
-                        df["_txt"], pb, df[km["resumen"]], df[km["titulo"]]
-                    )
-                    temas = consolidar_temas(subtemas, df["_txt"].tolist(), pb)
-                df[km["subtema"]] = subtemas
-                if epkl:
-                    tp = analizar_temas_con_pkl(df["_txt"].tolist(), epkl)
-                    if tp: df[km["tema"]] = tp
-                else:
-                    df[km["tema"]] = temas
-                s.update(label="✓ Paso 4 · Clasificación", state="complete")
+            
+        with st.status("Paso 3 · Tono (Reputación)", expanded=True) as s:
+            pb = st.progress(0)
+            if ("PKL" in mode or tpkl) and tpkl:
+                res = analizar_tono_con_pkl(df["_txt"].tolist(), tpkl)
+                if res is None: st.stop()
+            elif "API" in mode or "Híbrido" in mode:
+                res = await ClasificadorTono(bn, ba).procesar_lote_async(
+                    df["_txt"], pb, df[km["resumen"]], df[km["titulo"]], story_clusters
+                )
+            else:
+                res = [{"tono": "N/A"}] * len(ta)
+            df[km["tonoiai"]] = unificar_valores_por_historia([r["tono"] for r in res], story_clusters)
+            s.update(label="✓ Paso 3 · Tono (Reputación)", state="complete")
+            
+        with st.status("Paso 4 · Clasificación", expanded=True) as s:
+            pb = st.progress(0)
+            if "Solo Modelos PKL" in mode:
+                subtemas = ["N/A"] * len(ta)
+                temas    = ["N/A"] * len(ta)
+            else:
+                subtemas = ClasificadorSubtema(bn, ba).procesar_lote(
+                    df["_txt"], pb, df[km["resumen"]], df[km["titulo"]], story_clusters
+                )
+                subtemas = unificar_valores_por_historia(subtemas, story_clusters)
+                temas = consolidar_temas(subtemas, df["_txt"].tolist(), pb)
+                temas = unificar_valores_por_historia(temas, story_clusters)
+            df[km["subtema"]] = subtemas
+            if epkl:
+                tp = analizar_temas_con_pkl(df["_txt"].tolist(), epkl)
+                if tp:
+                    df[km["tema"]] = unificar_valores_por_historia(tp, story_clusters)
+            else:
+                df[km["tema"]] = temas
+            s.update(label="✓ Paso 4 · Clasificación", state="complete")
             
         rm2 = df.set_index("expanded_index").to_dict("index")
         for idx, row in enumerate(rows):
             if not row.get("is_duplicate"):
                 row.update(rm2.get(row.get("expanded_index"), {}))
+
+        # Los duplicados exactos conservan clasificación y story ID del canónico.
+        canon_por_id = {str(r.get(km["idnoticia"], "")): r for r in rows if not r.get("is_duplicate")}
+        for row in rows:
+            if not row.get("is_duplicate"): continue
+            canon = canon_por_id.get(str(row.get(km["idduplicada"], "")))
+            if canon:
+                for col in (km["tonoiai"], km["tema"], km["subtema"], km["idhistoria"]):
+                    row[col] = canon.get(col, row.get(col, ""))
                 
     gc.collect()
     ci = (st.session_state['tokens_input']     / 1e6) * PRICE_INPUT_1M
@@ -5127,40 +2864,28 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
 
 async def run_quick_async(df, tc, sc, bn, al):
     st.session_state.update({'tokens_input': 0, 'tokens_output': 0, 'tokens_embedding': 0})
-    for _k in ('telemetria_motor', 'avisos_motor', 'grupos_motor',
-               'embeddings_fallidos', 'embeddings_lotes_fallidos', 'embeddings_errores'):
-        st.session_state.pop(_k, None)
     get_embedding_cache().clear()
     df['_txt'] = df.apply(lambda r: texto_para_embedding(str(r.get(tc, "")), str(r.get(sc, ""))), axis=1)
+    story_clusters = construir_story_clusters(
+        df[sc].fillna('').tolist(), df[tc].fillna('').tolist()
+    )
+    df['ID Historia'] = story_clusters
     with st.status("Embeddings...", expanded=True) as s:
         _ = get_embeddings_batch(df['_txt'].tolist())
         s.update(label=f"✓ {get_embedding_cache().stats()}", state="complete")
-
-    if motor_precision_activo():
-        with st.status("Análisis de precisión", expanded=True) as s:
-            pb = st.progress(0)
-            resultado = await analizar_con_motor(
-                df[tc].fillna('').astype(str).tolist(),
-                df[sc].fillna('').astype(str).tolist(),
-                bn, al, pb, num_temas_max=15
-            )
-            df['Tono IA'] = resultado.tonos
-            df['Subtema'] = resultado.subtemas
-            df['Tema']    = resultado.temas
-            s.update(label="✓ Tono, subtema y tema coherentes", state="complete")
-    else:
-        with st.status("Tono", expanded=True) as s:
-            pb = st.progress(0)
-            res = await ClasificadorTono(bn, al).procesar_lote_async(df["_txt"], pb, df[sc].fillna(''), df[tc].fillna(''))
-            df['Tono IA'] = [r["tono"] for r in res]
-            s.update(label="✓ Tono", state="complete")
-        with st.status("Clasificación", expanded=True) as s:
-            pb = st.progress(0)
-            subtemas = ClasificadorSubtema(bn, al).procesar_lote(df["_txt"], pb, df[sc].fillna(''), df[tc].fillna(''))
-            df['Subtema'] = subtemas
-            temas = consolidar_temas(subtemas, df["_txt"].tolist(), pb)
-            df['Tema'] = temas
-            s.update(label="✓ Clasificación", state="complete")
+    with st.status("Tono", expanded=True) as s:
+        pb = st.progress(0)
+        res = await ClasificadorTono(bn, al).procesar_lote_async(df["_txt"], pb, df[sc].fillna(''), df[tc].fillna(''), story_clusters)
+        df['Tono IA'] = unificar_valores_por_historia([r["tono"] for r in res], story_clusters)
+        s.update(label="✓ Tono", state="complete")
+    with st.status("Clasificación", expanded=True) as s:
+        pb = st.progress(0)
+        subtemas = ClasificadorSubtema(bn, al).procesar_lote(df["_txt"], pb, df[sc].fillna(''), df[tc].fillna(''), story_clusters)
+        subtemas = unificar_valores_por_historia(subtemas, story_clusters)
+        df['Subtema'] = subtemas
+        temas = consolidar_temas(subtemas, df["_txt"].tolist(), pb)
+        df['Tema'] = unificar_valores_por_historia(temas, story_clusters)
+        s.update(label="✓ Clasificación", state="complete")
     df.drop(columns=['_txt'], inplace=True)
     ci = (st.session_state['tokens_input']     / 1e6) * PRICE_INPUT_1M
     co = (st.session_state['tokens_output']    / 1e6) * PRICE_OUTPUT_1M
@@ -5184,7 +2909,6 @@ def render_quick_tab():
             unsafe_allow_html=True
         )
         st.metric("Costo", st.session_state.get('quick_cost', "$0.00"))
-        render_panel_calidad()
         st.dataframe(st.session_state.quick_result.head(10), use_container_width=True)
         st.download_button(
             "Descargar",
@@ -5226,11 +2950,8 @@ def render_quick_tab():
                     try:
                         openai.api_key = st.secrets["OPENAI_API_KEY"]
                         openai.aiosession.set(None)
-                    except (KeyError, FileNotFoundError):
-                        st.error("OPENAI_API_KEY no encontrada en st.secrets.")
-                        st.stop()
-                    except Exception as e:
-                        st.error(f"No se pudo inicializar el cliente de OpenAI: {type(e).__name__}: {e}")
+                    except:
+                        st.error("OPENAI_API_KEY no encontrada.")
                         st.stop()
                     al = [a.strip() for a in bat.split(";") if a.strip()]
                     with st.spinner("Procesando..."):
@@ -5250,9 +2971,6 @@ def render_quick_tab():
 # ======================================
 async def run_custom_excel_async(file_bytes, tc, sc, bn, al, mode="API de OpenAI", tpkl=None, epkl=None):
     st.session_state.update({'tokens_input': 0, 'tokens_output': 0, 'tokens_embedding': 0})
-    for _k in ('telemetria_motor', 'avisos_motor', 'grupos_motor',
-               'embeddings_fallidos', 'embeddings_lotes_fallidos', 'embeddings_errores'):
-        st.session_state.pop(_k, None)
     get_embedding_cache().clear()
     t0 = time.time()
 
@@ -5269,92 +2987,77 @@ async def run_custom_excel_async(file_bytes, tc, sc, bn, al, mode="API de OpenAI
         lambda r: texto_para_embedding(str(r.get(tc, "")), str(r.get(sc, ""))),
         axis=1
     )
+    story_clusters = construir_story_clusters(
+        df[sc].fillna('').tolist(), df[tc].fillna('').tolist()
+    )
 
     with st.status("Paso 1 · Generando Embeddings...", expanded=True) as s:
         _ = get_embeddings_batch(df['_txt'].tolist())
         s.update(label=f"✓ Embeddings listos · {get_embedding_cache().stats()}", state="complete")
 
-    usar_motor = (
-        motor_precision_activo()
-        and not tpkl and not epkl
-        and "Solo Modelos PKL" not in mode
-        and ("API" in mode or "Híbrido" in mode)
-    )
-
-    if usar_motor:
-        with st.status("Paso 2 · Análisis de precisión (tono, subtema y tema)...", expanded=True) as s:
-            pb = st.progress(0)
-            resultado = await analizar_con_motor(
-                df[tc].fillna('').astype(str).tolist(),
-                df[sc].fillna('').astype(str).tolist(),
-                bn, al, pb, num_temas_max=15
+    # --- PASO 2: TONO ---
+    with st.status("Paso 2 · Evaluando Tono (Reputación)...", expanded=True) as s:
+        pb = st.progress(0)
+        if tpkl:
+            # Si se subió PKL de Sentimiento/Tono, usarlo directamente
+            res = analizar_tono_con_pkl(df["_txt"].tolist(), tpkl)
+            if res is None: st.stop()
+            tonos = unificar_valores_por_historia([r["tono"] for r in res], story_clusters)
+        elif "API" in mode or "Híbrido" in mode:
+            res = await ClasificadorTono(bn, al).procesar_lote_async(
+                df["_txt"], pb, df[sc].fillna(''), df[tc].fillna(''), story_clusters
             )
-            tonos    = resultado.tonos
-            subtemas = resultado.subtemas
-            temas    = resultado.temas
-            df['Tono IA'] = tonos
-            df['Subtema'] = subtemas
-            df['Tema']    = temas
-            s.update(label="✓ Tono, subtema y tema coherentes", state="complete")
-    else:
-        # --- PASO 2: TONO ---
-        with st.status("Paso 2 · Evaluando Tono (Reputación)...", expanded=True) as s:
-            pb = st.progress(0)
-            if tpkl:
-                # Si se subió PKL de Sentimiento/Tono, usarlo directamente
-                res = analizar_tono_con_pkl(df["_txt"].tolist(), tpkl)
-                if res is None: st.stop()
-                tonos = [r["tono"] for r in res]
-            elif "API" in mode or "Híbrido" in mode:
-                res = await ClasificadorTono(bn, al).procesar_lote_async(
-                    df["_txt"], pb, df[sc].fillna(''), df[tc].fillna('')
-                )
-                tonos = [r["tono"] for r in res]
+            tonos = unificar_valores_por_historia([r["tono"] for r in res], story_clusters)
+        else:
+            tonos = ["N/A"] * len(df)
+        df['Tono IA'] = tonos
+        s.update(label="✓ Tono IA evaluado", state="complete")
+
+    # --- PASO 3: SUBTEMAS Y TEMAS ---
+    with st.status("Paso 3 · Clasificando Subtemas y Temas...", expanded=True) as s:
+        pb = st.progress(0)
+        
+        # Subtemas
+        if "Solo Modelos PKL" in mode:
+            subtemas = ["N/A"] * len(df)
+        else:
+            subtemas = ClasificadorSubtema(bn, al).procesar_lote(
+                df["_txt"], pb, df[sc].fillna(''), df[tc].fillna(''), story_clusters
+            )
+            subtemas = unificar_valores_por_historia(subtemas, story_clusters)
+
+        # Temas
+        if epkl:
+            # Si se subió PKL de Temas, usar las predicciones directas del modelo
+            tp = analizar_temas_con_pkl(df["_txt"].tolist(), epkl)
+            if tp:
+                temas = unificar_valores_por_historia(tp, story_clusters)
             else:
-                tonos = ["N/A"] * len(df)
-            df['Tono IA'] = tonos
-            s.update(label="✓ Tono IA evaluado", state="complete")
-
-        # --- PASO 3: SUBTEMAS Y TEMAS ---
-        with st.status("Paso 3 · Clasificando Subtemas y Temas...", expanded=True) as s:
-            pb = st.progress(0)
-
-            # Subtemas
-            if "Solo Modelos PKL" in mode:
-                subtemas = ["N/A"] * len(df)
-            else:
-                subtemas = ClasificadorSubtema(bn, al).procesar_lote(
-                    df["_txt"], pb, df[sc].fillna(''), df[tc].fillna('')
-                )
-
-            # Temas
-            if epkl:
-                # Si se subió PKL de Temas, usar las predicciones directas del modelo
-                tp = analizar_temas_con_pkl(df["_txt"].tolist(), epkl)
-                if tp:
-                    temas = tp
-                else:
-                    temas = ["N/A"] * len(df)
-            elif "Solo Modelos PKL" in mode:
                 temas = ["N/A"] * len(df)
-            else:
-                temas = consolidar_temas(subtemas, df["_txt"].tolist(), pb)
+        elif "Solo Modelos PKL" in mode:
+            temas = ["N/A"] * len(df)
+        else:
+            temas = consolidar_temas(subtemas, df["_txt"].tolist(), pb)
+            temas = unificar_valores_por_historia(temas, story_clusters)
 
-            df['Subtema'] = subtemas
-            df['Tema']    = temas
-            s.update(label="✓ Clasificación completada", state="complete")
+        df['Subtema'] = subtemas
+        df['Tema']    = temas
+        df['ID Historia'] = story_clusters
+        s.update(label="✓ Clasificación completada", state="complete")
 
-    # Escribir las 3 columnas adicionales al final en la hoja openpyxl respetando el formato original
+    # Escribir las columnas enriquecidas al final respetando el formato original
     max_col = ws.max_column
     col_tono    = max_col + 1
     col_tema    = max_col + 2
     col_subtema = max_col + 3
+    col_historia = max_col + 4
 
     # Encabezados en negrita
     font_bold = Font(bold=True)
     ws.cell(row=1, column=col_tono, value="Tono IA").font = font_bold
     ws.cell(row=1, column=col_tema, value="Tema").font = font_bold
     ws.cell(row=1, column=col_subtema, value="Subtema").font = font_bold
+    ws.cell(row=1, column=col_historia, value="ID Historia").font = font_bold
 
     # Asignar valores por fila manteniendo la coincidencia exacta
     for idx, row_data in df.iterrows():
@@ -5362,6 +3065,7 @@ async def run_custom_excel_async(file_bytes, tc, sc, bn, al, mode="API de OpenAI
         ws.cell(row=r, column=col_tono, value=str(row_data['Tono IA']))
         ws.cell(row=r, column=col_tema, value=str(row_data['Tema']))
         ws.cell(row=r, column=col_subtema, value=str(row_data['Subtema']))
+        ws.cell(row=r, column=col_historia, value=str(row_data['ID Historia']))
 
     buf_out = io.BytesIO()
     wb.save(buf_out)
@@ -5390,8 +3094,6 @@ def render_custom_excel_tab():
         c1, c2 = st.columns(2)
         c1.metric("Costo estimado", st.session_state.get('custom_cost', "$0.00"))
         c2.metric("Tiempo de ejecución", st.session_state.get('custom_time', "0s"))
-
-        render_panel_calidad()
 
         if 'custom_df_preview' in st.session_state:
             st.markdown("##### Vista previa del archivo (primeras filas con columnas añadidas):")
@@ -5464,11 +3166,8 @@ def render_custom_excel_tab():
                         try:
                             openai.api_key = st.secrets["OPENAI_API_KEY"]
                             openai.aiosession.set(None)
-                        except (KeyError, FileNotFoundError):
+                        except:
                             st.error("OPENAI_API_KEY no encontrada en st.secrets.")
-                            st.stop()
-                        except Exception as e:
-                            st.error(f"No se pudo inicializar el cliente de OpenAI: {type(e).__name__}: {e}")
                             st.stop()
 
                     al = [a.strip() for a in bat.split(";") if a.strip()]
@@ -5566,21 +3265,14 @@ def main():
                 </div>""", unsafe_allow_html=True)
                 f1 = st.file_uploader("Dossier", type=["xlsx"], label_visibility="collapsed", key="f1")
 
-                # Los parámetros mostrados son los que el motor usa de verdad;
-                # antes se imprimían las constantes del pipeline antiguo, que ya
-                # no intervienen cuando el motor de precisión está activo.
-                _cfg_ui = ConfigPrecision()
                 st.markdown(
                     f'<div class="cluster-info">'
-                    f'<b>Motor de precisión</b> · Identidad={_cfg_ui.sim_identidad} '
-                    f'· Asunto={_cfg_ui.sim_asunto} (piso {_cfg_ui.piso_absoluto_asunto}) '
-                    f'· Tema={_cfg_ui.sim_tema} (piso {_cfg_ui.piso_absoluto_tema}) · '
-                    f'<b>Jaccard entidades={_cfg_ui.jaccard_entidades_min}</b> '
-                    f'· Overlap={_cfg_ui.overlap_tokens_min} '
-                    f'· Unif. etiquetas={_cfg_ui.sim_unificar_etiquetas} '
-                    f'· Especificidad=+{_cfg_ui.margen_especificidad} '
-                    f'· Confianza tono≥{_cfg_ui.confianza_minima_tono} '
-                    f'(se endurecen automáticamente en corpus pequeños)'
+                    f'<b>Parámetros base</b> · Sub={UMBRAL_SUBTEMA} · Tema={UMBRAL_TEMA} · Máx={NUM_TEMAS_MAX} '
+                    f'· FusInter={UMBRAL_FUSION_INTERGRUPO} · FusSem={UMBRAL_FUSION_SUBTEMAS} '
+                    f'· Dedup={UMBRAL_DEDUP_LABEL} · MinSub={UMBRAL_MIN_PERTENENCIA_SUBTEMA} '
+                    f'· MinTema={UMBRAL_MIN_PERTENENCIA_TEMA} · MaxGrupo={MAX_GRUPO_ETIQUETA} · '
+                    f'<b>Coherencia={UMBRAL_COHERENCIA_ETIQUETA}</b> · '
+                    f'<b>SimMin={SIM_MINIMA_AGRUPACION_SUBTEMA}</b> (adaptativos según n)'
                     f'</div>',
                     unsafe_allow_html=True
                 )
@@ -5627,7 +3319,6 @@ def main():
               <div class="metric-card m-cost"><div class="metric-val" style="color:var(--accent)">{cost}</div><div class="metric-lbl">Costo</div></div>
             </div>""", unsafe_allow_html=True)
             if 'cache_stats' in st.session_state: st.caption(f"📊 {st.session_state['cache_stats']}")
-            render_panel_calidad()
             c1, c2 = st.columns(2)
             c1.download_button(
                 "⬇ Descargar informe",
