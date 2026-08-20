@@ -936,7 +936,52 @@ def _menciona_marca_o_alias(texto: str, marca: str, aliases=None) -> bool:
         coincidencias = len(set(tokens_nombre) & tokens_texto)
         if coincidencias >= min(2, len(set(tokens_nombre))) and coincidencias / len(set(tokens_nombre)) >= 0.60:
             return True
+        if len(tokens_nombre) == 1:
+            token = tokens_nombre[0]
+            if len(token) >= 6 and any(
+                len(candidate) >= 6 and SequenceMatcher(None, token, candidate).ratio() >= 0.88
+                for candidate in tokens_texto
+            ):
+                return True
+        else:
+            # Compare each brand/alias token against nearby text tokens. This accepts
+            # small spelling differences while still requiring most of the name.
+            fuzzy_hits = 0
+            for token in set(tokens_nombre):
+                if any(
+                    candidate == token or (
+                        len(token) >= 5 and len(candidate) >= 5
+                        and SequenceMatcher(None, token, candidate).ratio() >= 0.86
+                    )
+                    for candidate in tokens_texto
+                ):
+                    fuzzy_hits += 1
+            required = max(1, int(np.ceil(len(set(tokens_nombre)) * 0.60)))
+            if fuzzy_hits >= required and (fuzzy_hits >= 2 or len(set(tokens_nombre)) == 1):
+                return True
     return False
+
+def _default_text_column_index(columns, preferred_names, fallback=0):
+    """Find common title/summary column spellings without accents or case sensitivity."""
+    normalized = [_normalizar_mencion(str(c)).replace("-", " ") for c in columns]
+    preferred = [_normalizar_mencion(x).replace("-", " ") for x in preferred_names]
+    for wanted in preferred:
+        for i, current in enumerate(normalized):
+            if current == wanted:
+                return i
+    for wanted in preferred:
+        for i, current in enumerate(normalized):
+            if wanted in current or current in wanted:
+                return i
+    return min(fallback, max(0, len(columns) - 1))
+
+def _safe_filename_part(value):
+    cleaned = re.sub(r'[^A-Za-z0-9_-]+', '_', unidecode(str(value or '')).strip())
+    return cleaned.strip('_') or 'marca'
+
+def _brand_audit(titulo, resumen, marca, aliases):
+    d = extraer_contexto_marca_detallado(titulo, resumen, marca, aliases)
+    return d['contexto'], d['coincidencia'], d['origen']
 
 def extraer_contexto_marca(titulo, resumen, marca, aliases=None, ventana=320):
     """Título + resumen si la marca/alias aparece. No recortar tanto como para perder 'ganadores'."""
@@ -954,8 +999,18 @@ def extraer_contexto_marca(titulo, resumen, marca, aliases=None, ventana=320):
     if titulo:
         bloques.append(titulo)
     bloques.extend(hits)
-    if resumen and resumen not in hits:
-        bloques.append(resumen[:900])
+    # Never append the complete summary: sentiment must stay centered on the brand.
+    if hits and len(" ".join(hits).split()) < 12:
+        all_parts = [p.strip() for p in partes if p.strip()]
+        for hit in hits:
+            try:
+                pos = all_parts.index(hit)
+                if pos and all_parts[pos - 1] not in bloques:
+                    bloques.insert(0, all_parts[pos - 1])
+                elif pos + 1 < len(all_parts) and all_parts[pos + 1] not in bloques:
+                    bloques.append(all_parts[pos + 1])
+            except ValueError:
+                pass
     vistos, out = set(), []
     for h in bloques:
         k = _normalizar_mencion(h)
@@ -963,6 +1018,23 @@ def extraer_contexto_marca(titulo, resumen, marca, aliases=None, ventana=320):
             vistos.add(k)
             out.append(h)
     return " ".join(out)[:1800] if out else texto[:1800]
+
+def extraer_contexto_marca_detallado(titulo, resumen, marca, aliases=None):
+    """Return auditable brand match metadata for sentiment analysis."""
+    titulo, resumen = str(titulo or "").strip(), str(resumen or "").strip()
+    nombres = _variantes_marca(marca, aliases)
+    title_hit = _menciona_marca_o_alias(titulo, marca, aliases)
+    summary_hit = _menciona_marca_o_alias(resumen, marca, aliases)
+    if not title_hit and not summary_hit:
+        return {"contexto": "", "marca_encontrada": "No", "origen": "", "coincidencia": ""}
+    origen = ", ".join(x for x, ok in (("Título", title_hit), ("Resumen", summary_hit)) if ok)
+    source = f"{titulo}. {resumen}".strip(" .")
+    source_norm = _normalizar_mencion(source)
+    matched = next((n for n in nombres if _coincide_nombre_completo(source_norm, n)), marca)
+    return {
+        "contexto": extraer_contexto_marca(titulo, resumen, marca, aliases),
+        "marca_encontrada": "Sí", "origen": origen, "coincidencia": matched,
+    }
 
 def _validar_etiqueta_completa(etiqueta, titulos_grp=None, resumenes_grp=None, marca="", aliases=None, fallback_fn=None):
     if not etiqueta or etiqueta.strip().lower() in ("sin tema", "varios", "n/a"):
@@ -1375,10 +1447,12 @@ class ClasificadorTono:
                 f"  - La noticia habla de una crisis del sector/país, pero la marca solo es mencionada informando o adaptándose.\n"
                 f"  - Se menciona a la marca de paso, sin rol (no aplica si es ganadora, premiada o protagonista).\n"
                 f"  - Una persona, autoridad, proveedor o tercero es quien recibe el efecto positivo o negativo.\n"
-                f"  - Emite un comunicado regular sin evidencia de crisis ni logro relevante.\n\n"
+                f"  - Emite un comunicado regular sin evidencia de crisis ni logro relevante.\n"
+                f"  - Critica, denuncia o advierte sobre un problema de terceros o del sector; la crítica de la marca NO es una crítica contra la marca.\n\n"
                 f"⚠️ ATENCIÓN: Ignora el tono del sector o de terceros. Evalúa ÚNICAMENTE cómo el hecho afecta "
                 f"la reputación corporativa de '{self.marca}': mejora (Positivo), empeora (Negativo) o no cambia (Neutro).\n\n"
-                f'Responde ÚNICAMENTE con JSON en este formato: {{"tono": "Positivo|Negativo|Neutro"}}'
+                f'Responde ÚNICAMENTE con JSON: {{"tono":"Positivo|Negativo|Neutro", '
+                f'"confianza":"Alta|Media|Baja", "justificacion":"explicación concreta de máximo 35 palabras"}}'
             )
 
             try:
@@ -1386,7 +1460,7 @@ class ClasificadorTono:
                     openai.ChatCompletion.acreate,
                     model=OPENAI_MODEL_CLASIFICACION,
                     messages=[{"role": "user", "content": prompt}],
-                    max_tokens=40,
+                    max_tokens=100,
                     temperature=0.0,
                     response_format={"type": "json_object"}
                 )
@@ -1399,9 +1473,15 @@ class ClasificadorTono:
                 resultado = json.loads(resp.choices[0].message.content)
                 tono = str(resultado.get("tono", "Neutro")).strip().title()
                 
-                return {"tono": tono if tono in ("Positivo", "Negativo", "Neutro") else "Neutro"}
+                tono = tono if tono in ("Positivo", "Negativo", "Neutro") else "Neutro"
+                confianza = str(resultado.get("confianza", "Media")).strip().title()
+                if confianza not in ("Alta", "Media", "Baja"):
+                    confianza = "Media"
+                return {"tono": tono, "confianza": confianza,
+                        "justificacion": str(resultado.get("justificacion", "")).strip()[:400],
+                        "evidencia": eval_txt[:1800]}
             except Exception as e:
-                return {"tono": "Neutro"}
+                return {"tono": "Neutro", "confianza": "Baja", "justificacion": "Error de clasificación", "evidencia": eval_txt[:1800]}
 
     async def procesar_lote_async(self, textos, pbar, resumenes, titulos):
         n = len(textos)
@@ -2796,6 +2876,7 @@ def generate_output_excel(rows, km):
         "Cuerpo Completo"   # ── ADICIÓN: columna final con el CuerpoEs completo, sin truncar ──
     ]
     NUM = {"ID Noticia", "Nro. Pagina", "Dimensión", "Duración - Nro. Caracteres", "CPE", "Tier", "Audiencia"}
+    ORDER += ["Contexto analizado", "Coincidencia marca", "Origen coincidencia"]
     ws.append(ORDER)
     
     font_hyperlink = Font(color="000000", underline=None)
@@ -2809,6 +2890,8 @@ def generate_output_excel(rows, km):
     col_idx_map = {name: ORDER.index(name) + 1 for name in ORDER}
         
     for row in rows:
+        ctx, match, origin = _brand_audit(row.get(km.get("titulo"), ""), row.get(km.get("resumen"), ""), st.session_state.get("brand_name", ""), st.session_state.get("brand_aliases", []))
+        row["Contexto analizado"], row["Coincidencia marca"], row["Origen coincidencia"] = ctx, match, origin
         tk = km.get("titulo")
         if tk and tk in row: row[tk] = clean_title_for_output(row.get(tk))
         rk = km.get("resumen")
@@ -3028,6 +3111,8 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
     co = (st.session_state['tokens_output']    / 1e6) * PRICE_OUTPUT_1M
     ce = (st.session_state['tokens_embedding'] / 1e6) * PRICE_EMBEDDING_1M
     
+    st.session_state["brand_name"] = bn
+    st.session_state["brand_aliases"] = ba
     with st.status("Paso 5 · Informe", expanded=True) as s:
         st.session_state["output_data"]     = generate_output_excel(rows, km)
         st.session_state["output_filename"] = f"Informe_IA_{bn.replace(' ', '_')}_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
@@ -3052,6 +3137,8 @@ async def run_quick_async(df, tc, sc, bn, al):
         pb = st.progress(0)
         res = await ClasificadorTono(bn, al).procesar_lote_async(df["_txt"], pb, df[sc].fillna(''), df[tc].fillna(''))
         df['Tono IA'] = [r["tono"] for r in res]
+        audits = [_brand_audit(r.get(tc, ''), r.get(sc, ''), bn, al) for _, r in df.iterrows()]
+        df['Contexto analizado'], df['Coincidencia marca'], df['Origen coincidencia'] = zip(*audits)
         s.update(label="✓ Tono", state="complete")
     with st.status("Clasificación", expanded=True) as s:
         pb = st.progress(0)
@@ -3068,7 +3155,15 @@ async def run_quick_async(df, tc, sc, bn, al):
     st.session_state['quick_cost'] = f"${ci + co + ce:.4f} USD"
     return df
 
-def gen_quick_excel(df):
+def gen_quick_excel(df, original_bytes=None):
+    if original_bytes:
+        wb = load_workbook(io.BytesIO(original_bytes))
+        ws = wb.active
+        start = ws.max_column + 1
+        for offset, col in enumerate([c for c in df.columns if c not in list(ws.values)[0]], start):
+            ws.cell(1, offset, col)
+            for i, value in enumerate(df[col].tolist(), 2): ws.cell(i, offset, value)
+        out = io.BytesIO(); wb.save(out); return out.getvalue()
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as w:
         df.to_excel(w, index=False, sheet_name='Analisis')
@@ -3087,7 +3182,7 @@ def render_quick_tab():
         st.dataframe(st.session_state.quick_result.head(10), use_container_width=True)
         st.download_button(
             "Descargar",
-            data=gen_quick_excel(st.session_state.quick_result),
+            data=gen_quick_excel(st.session_state.quick_result, st.session_state.get('quick_bytes')),
             file_name="Analisis_Rapido_IA.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
@@ -3104,7 +3199,8 @@ def render_quick_tab():
         f = st.file_uploader("Excel", type=["xlsx"], label_visibility="collapsed", key="qu")
         if f:
             try:
-                st.session_state.quick_df   = pd.read_excel(f)
+                st.session_state.quick_bytes = f.getvalue()
+                st.session_state.quick_df   = pd.read_excel(io.BytesIO(st.session_state.quick_bytes))
                 st.session_state.quick_name = f.name
                 st.rerun()
             except Exception as e:
@@ -3114,8 +3210,8 @@ def render_quick_tab():
         with st.form("qf"):
             cols = st.session_state.quick_df.columns.tolist()
             c1, c2 = st.columns(2)
-            tc = c1.selectbox("Col. título",  cols, 0)
-            sc = c2.selectbox("Col. resumen", cols, 1 if len(cols) > 1 else 0)
+            tc = c1.selectbox("Col. título", cols, _default_text_column_index(cols, ['Título', 'Titulo', 'Titular', 'Headline'], 0))
+            sc = c2.selectbox("Col. resumen", cols, _default_text_column_index(cols, ['CuerpoEs', 'Resumen - Aclaración', 'Resumen - Aclaracion', 'Resumen', 'Cuerpo', 'Descripción', 'Descripcion'], 1))
             bn  = st.text_input("Marca",       placeholder="Ej: Bancolombia")
             bat = st.text_input("Alias (;)",   placeholder="Ej: Grupo Bancolombia;Ban")
             if st.form_submit_button("Analizar", use_container_width=True, type="primary"):
@@ -3187,6 +3283,8 @@ async def run_custom_excel_async(file_bytes, tc, sc, bn, al, mode="API de OpenAI
         else:
             tonos = ["N/A"] * len(df)
         df['Tono IA'] = tonos
+        audits = [_brand_audit(r.get(tc, ''), r.get(sc, ''), bn, al) for _, r in df.iterrows()]
+        df['Contexto analizado'], df['Coincidencia marca'], df['Origen coincidencia'] = zip(*audits)
         s.update(label="✓ Tono IA evaluado", state="complete")
 
     # --- PASO 3: SUBTEMAS Y TEMAS ---
@@ -3224,12 +3322,18 @@ async def run_custom_excel_async(file_bytes, tc, sc, bn, al, mode="API de OpenAI
     col_tono    = max_col + 1
     col_tema    = max_col + 2
     col_subtema = max_col + 3
+    col_contexto = max_col + 4
+    col_coincidencia = max_col + 5
+    col_origen = max_col + 6
 
     # Encabezados en negrita
     font_bold = Font(bold=True)
     ws.cell(row=1, column=col_tono, value="Tono IA").font = font_bold
     ws.cell(row=1, column=col_tema, value="Tema").font = font_bold
     ws.cell(row=1, column=col_subtema, value="Subtema").font = font_bold
+    ws.cell(row=1, column=col_contexto, value="Contexto analizado").font = font_bold
+    ws.cell(row=1, column=col_coincidencia, value="Coincidencia marca").font = font_bold
+    ws.cell(row=1, column=col_origen, value="Origen coincidencia").font = font_bold
 
     # Asignar valores por fila manteniendo la coincidencia exacta
     for idx, row_data in df.iterrows():
@@ -3237,6 +3341,9 @@ async def run_custom_excel_async(file_bytes, tc, sc, bn, al, mode="API de OpenAI
         ws.cell(row=r, column=col_tono, value=str(row_data['Tono IA']))
         ws.cell(row=r, column=col_tema, value=str(row_data['Tema']))
         ws.cell(row=r, column=col_subtema, value=str(row_data['Subtema']))
+        ws.cell(row=r, column=col_contexto, value=str(row_data['Contexto analizado']))
+        ws.cell(row=r, column=col_coincidencia, value=str(row_data['Coincidencia marca']))
+        ws.cell(row=r, column=col_origen, value=str(row_data['Origen coincidencia']))
 
     buf_out = io.BytesIO()
     wb.save(buf_out)
@@ -3306,8 +3413,8 @@ def render_custom_excel_tab():
         with st.form("custom_form"):
             st.markdown('<div class="sec-label">Selección de Columnas</div>', unsafe_allow_html=True)
             c_col1, c_col2 = st.columns(2)
-            tc = c_col1.selectbox("Columna que contiene el TÍTULO", cols, index=0)
-            sc = c_col2.selectbox("Columna que contiene el RESUMEN / CUERPO", cols, index=1 if len(cols) > 1 else 0)
+            tc = c_col1.selectbox("Columna que contiene el TÍTULO", cols, index=_default_text_column_index(cols, ['Título', 'Titulo', 'Titular', 'Headline'], 0))
+            sc = c_col2.selectbox("Columna que contiene el RESUMEN / CUERPO", cols, index=_default_text_column_index(cols, ['CuerpoEs', 'Resumen - Aclaración', 'Resumen - Aclaracion', 'Resumen', 'Cuerpo', 'Descripción', 'Descripcion'], 1))
 
             st.markdown('<div class="sec-label">Configuración del Análisis</div>', unsafe_allow_html=True)
             cl, cr = st.columns([3, 2])
@@ -3368,6 +3475,53 @@ def render_custom_excel_tab():
 # ======================================
 # Main
 # ======================================
+async def run_sentiment_only_async(df, title_col, summary_col, brand, aliases, pkl_file=None):
+    details = [extraer_contexto_marca_detallado(r.get(title_col, ''), r.get(summary_col, ''), brand, aliases) for _, r in df.iterrows()]
+    df = df.copy()
+    idx = [i for i, d in enumerate(details) if d['contexto']]
+    results = [{'tono':'Neutro','confianza':'Alta','justificacion':'La marca no aparece en el título ni en el resumen.'} for _ in details]
+    if idx:
+        pb = st.progress(0)
+        if pkl_file:
+            raw = analizar_tono_con_pkl([details[i]['contexto'] for i in idx], pkl_file)
+        else:
+            raw = await ClasificadorTono(brand, aliases).procesar_lote_async(pd.Series([details[i]['contexto'] for i in idx]), pb, pd.Series([df.iloc[i][summary_col] for i in idx]), pd.Series([df.iloc[i][title_col] for i in idx]))
+        for i, r in zip(idx, raw or []): results[i].update(r)
+    df['Tono IA'] = [r.get('tono','Neutro') for r in results]
+    df['Confianza Tono'] = [r.get('confianza','Media') for r in results]
+    df['Marca encontrada'] = [d['marca_encontrada'] for d in details]
+    df['Contexto analizado'] = [d['contexto'] for d in details]
+    df['Coincidencia marca'] = [d['coincidencia'] for d in details]
+    df['Origen coincidencia'] = [d['origen'] for d in details]
+    return df
+
+def render_sentiment_tab():
+    st.markdown('<div class="sec-label">Sentimiento por Marca</div>', unsafe_allow_html=True)
+    st.caption('Analiza exclusivamente el impacto reputacional de la marca encontrada en título y resumen.')
+    f = st.file_uploader('Sube un Excel (.xlsx)', type=['xlsx'], key='sentiment_uploader')
+    if not f: return
+    try:
+        df = pd.read_excel(io.BytesIO(f.getvalue())); cols = df.columns.tolist()
+        with st.form('sentiment_form'):
+            tc = st.selectbox('Columna de título', cols, _default_text_column_index(cols, ['Título', 'Titulo', 'Titular', 'Headline'], 0))
+            sc = st.selectbox('Columna de resumen / aclaración', cols, _default_text_column_index(cols, ['CuerpoEs', 'Resumen - Aclaración', 'Resumen - Aclaracion', 'Resumen', 'Cuerpo', 'Descripción', 'Descripcion'], 1))
+            brand = st.text_input('Marca principal'); alias_text = st.text_input('Alias separados por ;')
+            pkl = st.file_uploader('Modelo PKL opcional', type=['pkl'], key='sentiment_pkl')
+            submit = st.form_submit_button('Analizar sentimiento', type='primary', use_container_width=True)
+        if submit:
+            if not brand.strip(): st.error('Ingresa la marca principal.')
+            else:
+                if not pkl: openai.api_key = st.secrets['OPENAI_API_KEY']
+                aliases = [a.strip() for a in alias_text.split(';') if a.strip()]
+                with st.spinner('Analizando menciones de la marca...'):
+                    result = asyncio.run(run_sentiment_only_async(df, tc, sc, brand.strip(), aliases, pkl))
+                st.dataframe(result.head(20), use_container_width=True)
+                out = io.BytesIO()
+                with pd.ExcelWriter(out, engine='openpyxl') as w: result.to_excel(w, index=False, sheet_name='Sentimiento')
+                output_name = f"sentimiento_{_safe_filename_part(brand)}.xlsx"
+                st.download_button('Descargar Excel de Sentimiento', out.getvalue(), output_name, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', use_container_width=True, type='primary')
+    except Exception as e: st.error(f'Error durante el análisis: {e}')
+
 def main():
     load_custom_css()
     if not check_password(): return
@@ -3382,7 +3536,7 @@ def main():
         <div class="app-header-badge">IA</div>
     </div>""", unsafe_allow_html=True)
 
-    tab1, tab2, tab3 = st.tabs(["Análisis Completo", "Análisis Rápido", "Excel Personalizado"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Análisis Completo", "Análisis Rápido", "Excel Personalizado", "Sentimiento"])
 
     with tab1:
         if not st.session_state.get("processing_complete", False):
@@ -3510,6 +3664,9 @@ def main():
 
     with tab3:
         render_custom_excel_tab()
+
+    with tab4:
+        render_sentiment_tab()
 
     st.markdown(
         '<div class="footer">v18.2 · Análisis de Noticias con IA · Johnathan Cortés ©</div>',
