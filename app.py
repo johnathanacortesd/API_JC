@@ -136,6 +136,10 @@ _VERBOS_LEAD_SUBTEMA = {
     "llegan", "supera", "superan", "alcanza", "alcanzan", "derrumba", "derrumban",
     "colapsa", "colapsan", "recupera", "recuperan", "avanza", "avanzan", "consolida",
     "consolidan", "espera", "esperan", "planea", "planean", "prepara", "preparan",
+    "plantea", "plantean", "planteo", "renuncia", "renuncian", "renuncio", "renuncio",
+    "asume", "asumen", "asumio", "asumieron", "posesiona", "posesionan", "posesiono",
+    "nombra", "nombran", "nombro", "nombramiento", "designa", "designan", "designo",
+    "designacion", "representante", "representa", "representan", "dimite", "dimitio",
 }
 
 _RE_VERBO_SUBTEMA = re.compile(
@@ -151,8 +155,181 @@ _RE_VERBO_SUBTEMA = re.compile(
     r'levanta|levantan|levantaron|levanto|impacta|impactan|encarece|encarecen|'
     r'encarecio|sube|suben|subio|baja|bajan|bajaron|gano|ganan|ganaron|'
     r'pierde|pierden|perdio|logra|logran|busca|buscan|crece|crecen|'
-    r'aumenta|aumentan|conquista|conquistan|derrumba|derrumban|recupera|recuperan)\b',
+    r'aumenta|aumentan|conquista|conquistan|derrumba|derrumban|recupera|recuperan|'
+    r'plantea|plantean|planteo|renuncia|renuncian|renuncio|asume|asumen|asumio|'
+    r'posesiona|posesionan|posesiono|nombra|nombran|nombro|designa|designan|designo|'
+    r'representa|representan|dimite|dimitio)\b',
     re.IGNORECASE)
+
+# ======================================
+# Subtema: reglas de apuntamiento (grounding) y rechazo de nombres propios/cargos
+# ======================================
+_CARGOS_SUBTEMA = {
+    "alcalde", "alcaldesa", "gobernador", "gobernadora", "ministro", "ministra",
+    "viceministro", "viceministra", "presidente", "presidenta", "vicepresidente",
+    "vicepresidenta", "director", "directora", "subdirector", "subdirectora",
+    "gerente", "rector", "rectora", "vicerrector", "vicerrectora", "decano", "decana",
+    "superintendente", "secretario", "secretaria", "procurador", "procuradora",
+    "contralor", "contralora", "defensor", "defensora", "magistrado", "magistrada",
+    "juez", "jueza", "fiscal", "concejal", "concejala", "senador", "senadora",
+    "representante", "diputado", "diputada", "comisionado", "comisionada",
+    "embajador", "embajadora", "consul", "vocero", "vocera", "portavoz",
+    "comandante", "coronel", "capitan", "obispo", "arzobispo", "cardenal",
+    "profesor", "profesora", "medico", "medica",
+}
+
+# Sustantivos abstractos/de evento que pueden encabezar un subtema válido.
+# (Se usa como "lista verde" para no marcar como nombre propio una cabeza legítima.)
+_CABEZAS_SUBTEMA_VALIDAS = {
+    "lanzamiento", "apertura", "inauguracion", "estreno", "presentacion", "anuncio",
+    "convenio", "acuerdo", "alianza", "pacto", "firma", "colaboracion", "cooperacion",
+    "partenariado", "inversion", "proyecto", "programa", "plan", "campana", "cruzada",
+    "iniciativa", "propuesta", "estrategia", "politica", "foro", "congreso", "cumbre",
+    "encuentro", "feria", "festival", "evento", "ceremonia", "jornada", "debate",
+    "conversatorio", "seminario", "taller", "capacitacion", "formacion", "educacion",
+    "intercambio", "visita", "gira", "premio", "premiacion", "reconocimiento",
+    "distincion", "condecoracion", "homenaje", "nombramiento", "designacion", "posesion",
+    "renuncia", "contratacion", "licitacion", "adjudicacion", "convocatoria",
+    "investigacion", "indagacion", "denuncia", "demanda", "sancion", "multa",
+    "sentencia", "fallo", "auditoria", "fiscalizacion", "veeduria", "regulacion",
+    "normativa", "reforma", "aprobacion", "expansion", "fusion", "adquisicion",
+    "compra", "venta", "exportacion", "importacion", "comercializacion", "negociacion",
+    "construccion", "infraestructura", "modernizacion", "renovacion", "restauracion",
+    "rehabilitacion", "ampliacion", "remodelacion", "instalacion", "operacion",
+    "intervencion", "prevencion", "atencion", "respuesta", "asistencia", "ayuda",
+    "apoyo", "solidaridad", "acompanamiento", "participacion", "adhesion",
+    "vinculacion", "integracion", "publicacion", "libro", "informe", "estudio",
+    "encuesta", "articulo", "documental", "serie", "podcast", "balance", "resultado",
+    "ranking", "clasificacion", "transicion", "transformacion", "digitalizacion",
+    "automatizacion", "optimizacion", "mejora", "avance", "progreso", "logro",
+    "exito", "triunfo", "crecimiento", "aumento", "reduccion", "crisis", "emergencia",
+    "catastrofe", "sismo", "terremoto", "desastre", "gestion", "administracion",
+    "coordinacion", "diagnostico", "evaluacion", "explotacion", "trata", "violencia",
+    "abuso", "acoso", "discriminacion", "inclusion", "equidad", "movilidad",
+    "transporte", "seguridad", "salud", "vivienda", "infancia", "juventud", "cultura",
+    "deporte", "turismo", "medioambiente", "energia", "tecnologia", "innovacion",
+    "emprendimiento", "empleo", "competitividad", "sostenibilidad", "reputacion",
+    "imagen", "comunicacion", "periodismo", "oratoria", "beca", "matricula",
+    "graduacion", "egresados", "curriculo", "oferta", "presupuesto", "financiacion",
+    "credito", "subsidio", "impuesto", "vacunacion", "salubridad", "cierre",
+    "suspension", "clausura", "reactivacion", "reapertura", "defensa", "queja",
+    "reclamo", "dialogo", "tregua", "conflicto", "victoria", "derrota", "record",
+    "ruta", "hoja", "financiamiento", "fortalecimiento", "cobertura", "puerto",
+    "estacion", "memoria", "patrimonio", "identidad", "grieta", "duelo", "salud",
+    "cobertura", "plataforma", "bootcamp", "open", "house", "sede", "revision",
+}
+
+_CONECTORES_ETIQUETA = {
+    "de", "del", "la", "el", "los", "las", "un", "una", "unos", "unas", "al", "lo",
+    "y", "e", "o", "u", "en", "sobre", "para", "por", "con", "sin", "ante", "bajo",
+    "hacia", "hasta", "entre", "tras", "contra", "desde", "segun", "mediante", "a",
+    "que", "como", "cuando", "donde", "cuyo", "cuya", "su", "sus", "mi", "mis",
+    "nuestro", "nuestra", "nuestros", "nuestras", "este", "esta", "estos", "estas",
+    "ese", "esa", "esos", "esas", "aquel", "aquella", "aquellos", "aquellas",
+}
+
+_ARTICULOS_SUBTEMA = {"el", "la", "los", "las", "un", "una", "unos", "unas", "lo"}
+
+
+def _normaliza_token(w):
+    return re.sub(r"[^a-z0-9]", "", unidecode(w.lower()))
+
+
+def _stem_es(w):
+    """Stem liviano en español: quita plurales/género y sufijos flexivos comunes."""
+    if len(w) <= 4:
+        return w
+    for suf in ("aciones", "amientos", "imientos", "dores", "ciones", "siones",
+                "idades", "mente", "es", "os", "as", "s", "a", "o", "e"):
+        if w.endswith(suf) and len(w) - len(suf) >= 4:
+            return w[:len(w) - len(suf)]
+    return w
+
+
+def _nombres_propios_iniciales_titulo(titulo):
+    """Toma el 'run' inicial de palabras en mayúscula del titular (sin artículos/nexos)
+    => candidatos de NOMBRE PROPIO (persona, lugar, marca) que no deben encabezar
+    el subtema."""
+    s = str(titulo or "").strip()
+    if not s:
+        return set()
+    toks = re.findall(r"[A-ZÁÉÍÓÚÑÜa-záéíóúñü]+", s)
+    res = set()
+    for w in toks:
+        if not w[:1].isupper():
+            break  # terminó el run de mayúsculas iniciales
+        norm = unidecode(w.lower())
+        if norm in _ARTICULOS_SUBTEMA or norm in {"de", "del", "a", "y", "e", "o", "u"} or len(norm) < 3:
+            continue  # artículo/nexo: lo saltamos pero seguimos mirando
+        res.add(norm)
+        # si tras un nombre propio viene una palabra en minúscula (verbo), terminamos el run
+        # (mantenemos el nombre capturado). Proseguimos sólo si el siguiente sigue en mayúscula.
+    return res
+
+
+def _empieza_por_nombre_propio(etiqueta, titulos_fuente=None):
+    """True si el subtema arranca por un cargo o por un nombre propio extraído del titular."""
+    s = (etiqueta or "").strip().strip('"\'')
+    if not s:
+        return False
+    toks = s.split()
+    if not toks:
+        return False
+    head = _normaliza_token(toks[0])
+    if head in _CARGOS_SUBTEMA:
+        return True
+    if titulos_fuente:
+        nombres = set()
+        for t in titulos_fuente:
+            nombres |= _nombres_propios_iniciales_titulo(t)
+        if head in nombres and head not in _CABEZAS_SUBTEMA_VALIDAS:
+            return True
+    return False
+
+
+def _contiene_numero_o_acronimo(etiqueta):
+    s = unidecode(etiqueta or "")
+    if re.search(r"\d", s):
+        return True
+    for w in s.split():
+        w = w.strip(".,;:!?")
+        if 1 <= len(w) <= 3 and w.isalpha() and w.isupper() and w not in {"LA", "EL", "LOS", "LAS", "DEL", "UN", "UNA"}:
+            return True
+    return False
+
+
+def _subtema_grounded(etiqueta, fuentes):
+    """True si TODA palabra de contenido (≥4 letras, no conector) del subtema aparece
+    (o deriva de forma evidente por _stem_es) en el TEXTO FUENTE. Evita 'inventos'."""
+    if not etiqueta or not fuentes:
+        return False
+    fuente_tokens = set()
+    fuente_stems = set()
+    for f in fuentes:
+        for w in re.findall(r"[a-z0-9]{4,}", unidecode(str(f).lower())):
+            fuente_tokens.add(w)
+            fuente_stems.add(_stem_es(w))
+    contenido = []
+    for w in etiqueta.split():
+        wt = _normaliza_token(w)
+        if not wt or len(wt) < 4 or wt in _CONECTORES_ETIQUETA:
+            continue
+        contenido.append(wt)
+    if not contenido:
+        return True  # sólo conectores / palabras cortas: nada que "inventar"
+    no_coinciden = 0
+    for w in contenido:
+        ws = _stem_es(w)
+        if w in fuente_tokens or ws in fuente_tokens or ws in fuente_stems:
+            continue
+        # coincidencia por raíz/prefijo (mínimo 4 letras en común)
+        if any((fs.startswith(w) or w.startswith(fs)) and min(len(fs), len(w)) >= 4
+               for fs in fuente_stems):
+            continue
+        no_coinciden += 1
+    # Exigimos que como máximo UNA palabra de contenido quede sin apuntar al texto.
+    return no_coinciden <= 1
+
 
 _PATRON_TITULAR = re.compile(
     r"^(nuevo|nueva|anuncia|lanza|presenta|inaugura|llega|abre|inicia|"
@@ -2068,13 +2245,6 @@ class ClasificadorSubtema:
             pbar.progress(min(ps + 0.04 * (it + 1), 0.52), f"Fusión {it + 1}: {fus}")
             if fus == 0: break
 
-    def _extraer_keywords_titulos(self, titulos_grp: list, top_n: int = 6) -> list:
-        palabras = []
-        for t in titulos_grp[:10]:
-            for w in string_norm_label(t).split():
-                if len(w) > 3: palabras.append(w)
-        return [w for w, _ in Counter(palabras).most_common(top_n)]
-
     def _generar_etiqueta(self, textos_grp, titulos_grp, resumenes_grp, subtemas_existentes=None, evitar_etiqueta=None):
         tn = sorted(set(normalize_title_for_comparison(t) for t in titulos_grp if t))
         existentes_key = "|".join(sorted(string_norm_label(s) for s in (subtemas_existentes or []))[:20])
@@ -2082,76 +2252,55 @@ class ClasificadorSubtema:
         ck = hashlib.md5(("|".join(tn[:12]) + f"#{len(titulos_grp)}#{existentes_key}#{evitar_key}").encode()).hexdigest()
         if ck in self._cache: return self._cache[ck]
 
-        tm = list(dict.fromkeys(str(t)[:130] for t in titulos_grp if pd.notna(t) and str(t).strip() and str(t).strip().lower() != 'nan'))[:6]
-        rm = [str(r)[:200] for r in resumenes_grp[:3] if r and len(str(r)) > 20]
+        tm = list(dict.fromkeys(str(t)[:160] for t in titulos_grp if pd.notna(t) and str(t).strip() and str(t).strip().lower() != 'nan'))[:6]
+        rm = [str(r)[:260] for r in resumenes_grp[:3] if r and len(str(r)) > 20]
 
-        kw_list = self._extraer_keywords_titulos(titulos_grp, top_n=8)
-        palabras_res = []
-        for r in resumenes_grp[:5]:
-            for w in string_norm_label(str(r)).split():
-                if len(w) > 4: palabras_res.append(w)
-        kw_res = [w for w, _ in Counter(palabras_res).most_common(4)
-                  if w not in {unidecode(k.lower()) for k in kw_list}]
-        kw_todos = kw_list + kw_res
-        kw = ", ".join(kw_todos[:10])
-
-        ctx_resumenes = (
-            "\nRESÚMENES (para contexto):\n"
-            + "\n".join(f"  · {r}" for r in rm)
-        ) if rm else ""
-
-        if len(kw_list) >= 3:
-            ejemplo_dinamico = (
-                f"'{kw_list[0].title()} de {kw_list[1].title()}' o "
-                f"'{kw_list[0].title()} del {kw_list[2].title()}'"
-            )
-        elif len(kw_list) >= 2:
-            ejemplo_dinamico = f"'{kw_list[0].title()} de {kw_list[1].title()}'"
-        elif len(kw_list) == 1:
-            ejemplo_dinamico = f"'{kw_list[0].title()} en la región'"
-        else:
-            ejemplo_dinamico = "'Proyecto de terminal de transportes'"
+        # Fuentes para el "grounding": título + resumen + texto rico (ya incluye contexto de la marca).
+        fuentes_grounding = [str(t) for t in titulos_grp if t and str(t).strip()]
+        fuentes_grounding += [str(r) for r in resumenes_grp if r and str(r).strip()]
+        fuentes_grounding += [str(t) for t in textos_grp[:3] if t and str(t).strip()]
 
         lista_existentes = ""
         if subtemas_existentes and len(subtemas_existentes) > 0:
             lista_existentes = (
-                "\n\nSUBTEMAS YA CREADOS (ÚSALOS SI APLICAN EXACTAMENTE):\n" +
-                ", ".join(f"'{s}'" for s in subtemas_existentes[:15]) +
-                "\nREGLA: Si este grupo de noticias trata EXACTAMENTE del mismo tema que uno de los subtemas ya creados, responde con ese subtema. Si es un tema distinto, crea uno nuevo."
+                "\n\nSUBTEMAS YA CREADOS (REUTILÍZALOS SOLO SI ES EXACTAMENTE EL MISMO HECHO):\n"
+                + ", ".join(f"'{s}'" for s in subtemas_existentes[:15])
+                + "\nSi este grupo de noticias trata EXACTAMENTE el mismo hecho que uno de los subtemas ya creados, "
+                "responde con ese subtema palabra por palabra. Si es otro hecho, crea uno nuevo."
             )
         if evitar_etiqueta:
-            lista_existentes += (
-                f"\nNO uses '{evitar_etiqueta}': este grupo es un evento distinto, genera un subtema nuevo y específico."
-            )
+            lista_existentes += f"\nNO uses '{evitar_etiqueta}': es un hecho distinto, genera un subtema nuevo y específico."
+
+        bloq_resumenes = ("\nRESÚMENES:\n" + "\n".join(f"  · {r}" for r in rm)) if rm else ""
 
         prompt = (
-            f"Eres analista de reputación de la marca principal '{self.marca}'. "
-            "Genera UN subtema periodístico (3-5 palabras) que sea una FRASE NOMINAL "
-            "— sin sujeto ni verbo conjugado — para este grupo de noticias. "
-            "Si el hecho NO está vinculado con la marca, describe el tema real de la noticia "
-            "y NO fuerces una relación con la marca.\n\n"
-            "TÍTULOS:\n" + "\n".join(f"  · {t}" for t in tm)
-            + ctx_resumenes
-            + f"\n\nPALABRAS CLAVE: {kw}"
+            f"Eres analista de reputación que monitorea noticias sobre '{self.marca}'.\n"
+            "Lee las noticias de este grupo y resume EL HECHO periodístico central en UNA sola "
+            "frase nominal descriptiva de 3 a 5 palabras, gramaticalmente correcta y con sentido lógico completo.\n\n"
+            "CÓMO CONSTRUIRLA:\n"
+            "  1. Identifica primero el TIPO de hecho: lanzamiento, convenio, alianza, inversión, "
+            "proyecto, campaña, foro, premiación, reconocimiento, nombramiento, designación, posesión, "
+            "renuncia, investigación, sanción, publicación de un libro, apertura, intercambio, etc.\n"
+            "  2. Escribe: [tipo de hecho] + [preposición: de/del/para/sobre/en] + [objeto o asunto concreto]. "
+            "La frase debe leerse como un encabezado de nota, con orden natural.\n"
+            "  3. Usa SOLO palabras que aparezcan en el texto analizado (o sus derivadas directas, "
+            "ej. 'renunció' → 'renuncia'). NO inventes nombres, lugares, cargos ni términos.\n"
+            "  4. Sintetiza el hecho; NO copies el titular completo ni frases sueltas del texto.\n"
+            "  5. Si el hecho NO está vinculado con la marca, describe el tema real de la noticia sin forzar la relación.\n\n"
+            "PROHIBIDO (se rechaza automáticamente):\n"
+            "  - Empezar por nombre de persona o cargo ('Jesús Martínez', 'Ever Pallares', 'Alcalde', 'Gobernador', 'Superintendente').\n"
+            "  - Empezar por un lugar o país ('La Guajira', 'Colombia', 'Barranquilla').\n"
+            "  - Verbo conjugado ('presenta', 'lanza', 'plantea', 'renunció', 'asume', 'fue').\n"
+            "  - Dos sustantivos pegados sin preposición ('Guajira escenario', 'Colombia escudo').\n"
+            "  - Adjetivo después de 'de' cuando debe ir pegado ('Explotación de sexual' es incorrecto; correcto: 'Explotación sexual').\n"
+            "  - Etiquetas genéricas ('Gestión corporativa', 'Actividad institucional').\n\n"
+            f"TÍTULOS:\n" + "\n".join(f"  · {t}" for t in tm)
+            + bloq_resumenes
             + lista_existentes
-            + "\n\nREGLAS OBLIGATORIAS:\n"
-            + f"  0. Usa solo hechos vinculados con '{self.marca}' o sus alias; valida la mención en título o resumen.\n"
-            + "     El subtema debe describir qué ocurre con la marca (no solo repetir su nombre).\n"
-            "  1. FRASE NOMINAL PURA: empieza con sustantivo, usa preposición para unir conceptos.\n"
-            "     NUNCA empieces con cargo/persona ('Alcalde', 'Gobernador', 'Ministro').\n"
-            "     NUNCA incluyas verbo conjugado ('presenta', 'anuncia', 'lanza', 'inaugura').\n"
-            f"     CORRECTO: {ejemplo_dinamico}\n"
-            "     INCORRECTO: 'Alcalde presenta proyecto terminal', "
-            "'Gobernador anuncia inversión', 'Alcaldía lanza plan'\n"
-            "  2. USA preposiciones (de, del, para, sobre, en, por) para conectar concepts.\n"
-            "  3. SÉ ESPECÍFICO: describe el asunto real, no el actor.\n"
-            "  4. Ciudades y regiones SÍ pueden aparecer si son relevantes al tema.\n"
-            "  5. Puedes usar la marca completa si aporta claridad y cabe en cinco palabras. Tildes y ñ correctas.\n\n"
-            "EJEMPLOS CORRECTOS: 'Proyecto de terminal de transportes', "
-            "'Operación del Canal del Dique', 'Plan de infraestructura vial', "
-            "'Regulación de tarifas eléctricas', 'Inversión en salud pública'\n"
-            "EJEMPLOS INCORRECTOS: 'Alcalde presenta proyecto', 'Gobernador lanza plan', "
-            "'Tarifas energía', 'Gestión corporativa', 'Actividad legislativa'\n\n"
+            + "\n\nEJEMPLOS CORRECTOS: 'Convenio de cooperación científica', 'Reconocimiento al liderazgo regional', "
+            "'Intercambio intercultural en La Guajira', 'Explotación sexual de menores', 'Posesión del superintendente de Notariado'\n"
+            "EJEMPLOS INCORRECTOS: 'Jesus de martinez', 'Ever de pallares', 'Guajira de escenario', 'Colombia de escudo', "
+            "'Foro de plantea', 'Memoria de caribe', 'Divorcio de sirena'\n\n"
             'JSON: {"subtema":"..."}'
         )
 
@@ -2168,7 +2317,10 @@ class ClasificadorSubtema:
             r'levanta|levantan|levantaron|levanto|impacta|impactan|encarece|encarecen|'
             r'encarecio|sube|suben|subio|baja|bajan|bajaron|gano|ganan|ganaron|'
             r'pierde|pierden|perdio|logra|logran|busca|buscan|crece|crecen|'
-            r'aumenta|aumentan|conquista|conquistan|derrumba|derrumban|recupera|recuperan)\\b',
+            r'aumenta|aumentan|conquista|conquistan|derrumba|derrumban|recupera|recuperan|'
+            r'plantea|plantean|planteo|renuncia|renuncian|renuncio|asume|asumen|asumio|'
+            r'posesiona|posesionan|posesiono|nombra|nombran|nombro|designa|designan|designo|'
+            r'representa|representan|dimite|dimitio)\b',
             re.IGNORECASE
         )
 
@@ -2199,9 +2351,9 @@ class ClasificadorSubtema:
             et = limpiar_tema(raw)
 
             if not et or et.strip().lower() == "sin tema":
-                et = self._refinar(tm, kw, rm, forzar_preposicion=True)
+                et = self._refinar(tm, None, rm, forzar_preposicion=True, prohibir_verbos=True)
             if _tiene_verbo_conjugado(et):
-                et = self._refinar(tm, kw, rm, forzar_preposicion=True, prohibir_verbos=True)
+                et = self._refinar(tm, None, rm, forzar_preposicion=True, prohibir_verbos=True)
 
             def _es_robotico(s):
                 palabras = s.split()
@@ -2223,17 +2375,27 @@ class ClasificadorSubtema:
             es_rob = _es_robotico(et)
 
             if es_gen or es_solo_marca or es_rob or len(et.split()) < 3:
-                et = self._refinar(tm, kw, rm, forzar_preposicion=True)
+                et = self._refinar(tm, None, rm, forzar_preposicion=True, prohibir_verbos=True)
 
             if not _validar_estructura_subtema(et):
-                et = self._refinar(tm, kw, rm, forzar_preposicion=True)
+                et = self._refinar(tm, None, rm, forzar_preposicion=True, prohibir_verbos=True)
                 if not _validar_estructura_subtema(et):
                     et = self._fallback(titulos_grp)
 
-            # REFUERZO anti-frases-sin-sentido: verbo conjugado / verbo al inicio / robotica
-            if _tiene_verbo_conjugado(et) or _primera_palabra_verbo(et) or _es_robotico(et):
-                et = self._refinar(tm, kw, rm, forzar_preposicion=True, prohibir_verbos=True)
-            if _tiene_verbo_conjugado(et) or _primera_palabra_verbo(et):
+            # Refuerzo 1: nombres propios / cargos / números / siglas
+            if _empieza_por_nombre_propio(et, titulos_grp) or _contiene_numero_o_acronimo(et):
+                et = self._refinar(tm, None, rm, forzar_preposicion=True, prohibir_verbos=True, prohibir_nombres=True)
+            if _empieza_por_nombre_propio(et, titulos_grp) or _contiene_numero_o_acronimo(et):
+                et = self._fallback(titulos_grp)
+
+            # Refuerzo 2: grounding (no inventos)
+            if not _subtema_grounded(et, fuentes_grounding):
+                et = self._refinar(tm, None, rm, forzar_preposicion=True, prohibir_verbos=True)
+            if not _subtema_grounded(et, fuentes_grounding):
+                et = self._fallback(titulos_grp)
+
+            # Refuerzo final anti-frases-sin-sentido
+            if _tiene_verbo_conjugado(et) or _primera_palabra_verbo(et) or _es_robotico(et) or _empieza_por_nombre_propio(et, titulos_grp):
                 et = self._fallback(titulos_grp)
 
             et = _validar_etiqueta_completa(
@@ -2241,7 +2403,7 @@ class ClasificadorSubtema:
                 marca=self.marca, aliases=self.aliases, fallback_fn=self._fallback
             )
             if _es_nombre_o_fragmento_marca(et, self.marca, self.aliases):
-                et = self._refinar(tm, kw, rm, forzar_preposicion=True, prohibir_verbos=True)
+                et = self._refinar(tm, None, rm, forzar_preposicion=True, prohibir_verbos=True, prohibir_nombres=True)
             if _es_nombre_o_fragmento_marca(et, self.marca, self.aliases):
                 et = self._fallback(titulos_grp)
         except:
@@ -2251,41 +2413,26 @@ class ClasificadorSubtema:
         self._cache[ck] = et
         return et
 
-    def _refinar(self, titulos, kw, resumenes=None, forzar_preposicion=False, prohibir_verbos=False):
-        ctx = ("\nContexto de resúmenes: " + " | ".join(r[:100] for r in resumenes[:3])) if resumenes else ""
-        kw_parts = [w.strip() for w in kw.split(",") if w.strip()]
-
-        if len(kw_parts) >= 3:
-            ej_bueno = f"'{kw_parts[0].title()} de {kw_parts[1].title()}', '{kw_parts[0].title()} en {kw_parts[2].title()}'"
-        elif len(kw_parts) >= 2:
-            ej_bueno = f"'{kw_parts[0].title()} de {kw_parts[1].title()}'"
-        elif len(kw_parts) == 1:
-            ej_bueno = f"'{kw_parts[0].title()} en la región'"
-        else:
-            ej_bueno = "'Proyecto de terminal de transportes'"
-
-        ej_malo = f"'{kw_parts[0].title()} {kw_parts[1].title()}' (sin preposición)" if len(kw_parts) >= 2 else "'Actividad corporativa', 'Gestión institucional'"
-
-        instruccion_prep = (
-            "  OBLIGATORIO: usa una preposición (de, del, para, sobre, en, por) "
-            "entre los conceptos. NUNCA dos sustantivos pegados sin nexo.\n"
-        ) if forzar_preposicion else ""
-
-        instruccion_verbo = (
-            "  PROHIBIDO: verbos conjugados ('presenta', 'anuncia', 'lanza', 'inaugura', etc.). "
-            "Solo frases nominales (sustantivos + preposiciones).\n"
-            "  NUNCA empieces con cargo ('Alcalde', 'Gobernador', 'Ministro', 'Director').\n"
-        ) if prohibir_verbos else ""
+    def _refinar(self, titulos, kw=None, resumenes=None, forzar_preposicion=False, prohibir_verbos=False, prohibir_nombres=False):
+        ctx = ("\nContexto: " + " | ".join(str(r)[:140] for r in (resumenes or [])[:3])) if resumenes else ""
+        restricciones = []
+        if forzar_preposicion:
+            restricciones.append("Incluye una preposición (de/del/para/sobre/en) entre los conceptos.")
+        if prohibir_verbos:
+            restricciones.append("Prohibido: verbos conjugados y empezar por cargo o nombre de persona.")
+        if prohibir_nombres:
+            restricciones.append("Prohibido: empezar por nombre de persona o de lugar.")
+        bloque_rest = ("\n".join("  - " + r for r in restricciones)) if restricciones else "  - (ninguna adicional)"
 
         prompt = (
-            f"Eres analista de reputación de '{self.marca}'. Genera UN subtema periodístico (3-5 palabras) "
-            "como frase nominal sin verbo conjugado.\n\n"
-            f"Títulos: {' | '.join(titulos[:5])}{ctx}\n"
-            f"Keywords: {kw}\n\n"
-            f"{instruccion_prep}{instruccion_verbo}"
-            f"CORRECTO: {ej_bueno}, 'Tarifas de energía eléctrica'\n"
-            f"INCORRECTO: {ej_malo}, 'Alcalde presenta plan'\n"
-            "Tildes y ñ correctas. Describe el hecho vinculado con la marca; no respondas solo su nombre.\n"
+            f"Eres analista de reputación de '{self.marca}'. Reescribe el hecho de las noticias "
+            "en UNA frase nominal descriptiva de 3-5 palabras, correcta y completa, con orden lógico.\n\n"
+            f"Títulos:\n" + "\n".join(f"  · {t[:150]}" for t in titulos[:5]) + ctx + "\n\n"
+            f"Restricciones:\n{bloque_rest}\n\n"
+            "Formato correcto: [tipo de hecho] + [preposición] + [objeto/asunto]. "
+            "Ej.: 'Convenio de cooperación científica', 'Investigación por fallas operativas', "
+            "'Explotación sexual de menores'.\n"
+            "Usa SOLO palabras del texto. Tildes y ñ correctas. No copies el titular literal.\n"
             'JSON: {"subtema":"..."}'
         )
         try:
@@ -2308,45 +2455,60 @@ class ClasificadorSubtema:
 
     def _fallback(self, titulos):
         if not titulos: return "Cobertura de información relevante"
-        texto_total = " ".join(str(t) for t in titulos[:5])
-        norm_total = _normalizar_mencion(texto_total)
 
-        # Respaldo genérico: identifica el tipo de hecho y su objeto, sin reglas por cliente.
+        nombres_iniciales = set()
+        for t in titulos:
+            nombres_iniciales |= _nombres_propios_iniciales_titulo(t)
+
         acciones = [
-            (r"\b(lanzamiento|lanza|lanzo|presenta|presento|estrena|estreno)\b", "Lanzamiento"),
+            (r"\b(lanzamiento|lanza|lanzo|estrena|estreno|presenta|presento)\b", "Lanzamiento"),
             (r"\b(anuncia|anuncio)\b", "Anuncio"),
             (r"\b(inaugura|inauguro|apertura|abre|abrio)\b", "Apertura"),
             (r"\b(firma|firmo|suscribe|suscribio|convenio|alianza)\b", "Convenio"),
-            (r"\b(recibe|recibio|premio|reconocimiento)\b", "Reconocimiento"),
-            (r"\b(investiga|investigacion|sancion|demanda)\b", "Investigación"),
+            (r"\b(recibe|recibio|premio|reconocimiento|galardon|distincion|honoris|causa)\b", "Reconocimiento"),
+            (r"\b(investiga|investigacion|sancion|denuncia|demanda)\b", "Investigación"),
+            (r"\b(renuncia|renuncio|dimite|dimitio)\b", "Renuncia"),
+            (r"\b(designa|designo|nombra|nombro|asume|asumio|posesiona|posesiono|representante)\b", "Designación"),
         ]
-        accion = next((nombre for patron, nombre in acciones if re.search(patron, norm_total)), None)
-        palabras = []
+        texto_total = " ".join(str(t) for t in titulos[:5])
+        accion = next((nombre for patron, nombre in acciones if re.search(patron, unidecode(texto_total.lower()), re.IGNORECASE)), None)
+
         tokens_marca = set(_normalizar_mencion(" ".join([self.marca] + self.aliases)).split())
-        excluir = tokens_marca | STOPWORDS_ES | _VERBOS_LEAD_SUBTEMA | {
+        excluir = tokens_marca | STOPWORDS_ES | _VERBOS_LEAD_SUBTEMA | _CARGOS_SUBTEMA | nombres_iniciales | {
             "universidad", "empresa", "compania", "corporacion", "fundacion", "institucion",
-            "anuncio", "anuncia", "anuncio", "lanzamiento", "lanza", "presenta", "presencia",
-            "invitado", "especial", "principal", "marca", "cliente",
+            "anuncio", "anuncia", "lanzamiento", "lanza", "presenta", "presencia",
+            "invitado", "especial", "principal", "marca", "cliente", "noticia",
             "ultimo", "ultima", "ultimos", "ultimas", "nuevo", "nueva", "nuevos", "nuevas",
             "poder", "suerte", "gran", "grande", "grandes", "coccion", "lenta", "medio",
             "parte", "manera", "forma", "tipo", "asi", "pues", "mismo", "misma",
+            "escenario", "escenarios", "contexto", "contextos", "varios", "toneladas",
         }
+        # Recolectar palabras de contenido CONSERVANDO su forma original (con acentos).
+        palabras_ordenadas = []
         for t in titulos[:5]:
-            for w in string_norm_label(t).split():
-                if len(w) >= 4 and w not in excluir and not _RE_VERBO_SUBTEMA.search(w): palabras.append(w)
-        if palabras:
-            top = [w for w, _ in Counter(palabras).most_common(3)]
-            if accion:
-                objeto = " ".join(top[:3])
-                frase = _recortar_frase_completa(f"{accion} de {objeto}", MAX_PALABRAS_SUBTEMA)
-                if _frase_esta_completa(frase) and not _es_nombre_o_fragmento_marca(frase, self.marca, self.aliases):
-                    return capitalizar_etiqueta(frase)
-            if len(top) >= 2:
-                frase = f"{top[0]} de {top[1]}"
-                if _frase_esta_completa(frase) and not _es_nombre_o_fragmento_marca(frase, self.marca, self.aliases):
-                    return capitalizar_etiqueta(frase)
-                return capitalizar_etiqueta(f"Asuntos de {top[0]} y {top[1]}")
-            return capitalizar_etiqueta(f"Asuntos relacionados con {top[0]}")
+            for w in re.findall(r"[A-Za-zÁÉÍÓÚÑÜáéíóúñü]+", str(t)):
+                norm = _normaliza_token(w)
+                if (len(norm) >= 4 and norm not in excluir
+                        and norm not in _TRAILING_INCOMPLETE
+                        and not _RE_VERBO_SUBTEMA.search(norm)):
+                    palabras_ordenadas.append((norm, w))
+        if palabras_ordenadas:
+            cnt = Counter(p[0] for p in palabras_ordenadas)
+            top_norm = [n for n, _ in cnt.most_common(3)]
+            origen = {}
+            for norm, orig in palabras_ordenadas:
+                origen.setdefault(norm, orig)
+            top = [origen[n].lower() for n in top_norm]
+            if accion and top:
+                frase = _recortar_frase_completa(f"{accion} de {' '.join(top[:2])}", MAX_PALABRAS_SUBTEMA)
+            elif accion:
+                frase = _recortar_frase_completa(accion, MAX_PALABRAS_SUBTEMA)
+            elif top:
+                frase = _recortar_frase_completa(" ".join(top[:3]), MAX_PALABRAS_SUBTEMA)
+            else:
+                frase = ""
+            if _frase_esta_completa(frase) and not _es_nombre_o_fragmento_marca(frase, self.marca, self.aliases):
+                return capitalizar_etiqueta(frase)
         return "Cobertura de información relevante"
 
     def _consolidar_sinonimos_llm(self, subtemas_unicos):
@@ -3130,13 +3292,13 @@ def generate_output_excel(rows, km):
         "ID Noticia", "Fecha", "Hora", "Medio", "Tipo de Medio",
         "Sección - Programa", "Región", "Título", "Autor - Conductor",
         "Nro. Pagina", "Dimensión", "Duración - Nro. Caracteres",
-        "CPE", "Tier", "Audiencia", "Tono", "Tono IA", "Tema", "Subtema", "Grupo noticia",
+        "CPE", "Audiencia", "Tier", "Tono IA", "Tema", "Subtema",
         "Link Nota", "Resumen - Aclaracion", "Link (Streaming - Imagen)", "Menciones - Empresa",
         "ID duplicada",
         "Cuerpo Completo"   # ── ADICIÓN: columna final con el CuerpoEs completo, sin truncar ──
     ]
     NUM = {"ID Noticia", "Nro. Pagina", "Dimensión", "Duración - Nro. Caracteres", "CPE", "Tier", "Audiencia"}
-    ORDER += ["Contexto analizado", "Coincidencia marca", "Origen coincidencia"]
+    ORDER += ["Contexto analizado", "Coincidencia marca", "Origen coincidencia", "Tono", "Grupo noticia"]
     ws.append(ORDER)
     
     font_hyperlink = Font(color="000000", underline=None)
