@@ -1,10 +1,6 @@
 streamlit>=1.36,<2
 pandas>=2.1,<3
 openpyxl>=3.1,<4
-# openai 0.28 (API legacy ChatCompletion). También se usa para AgentRouter:
-# su API es OpenAI-compatible (https://agentrouter.org/v1, sirve deepseek-v4-flash)
-# y se configura vía DEEPSEEK_API_KEY + openai.api_base (ver README).
-# NO actualizar a openai>=1.0: rompe ChatCompletion.create.
 openai==0.28.0
 tqdm
 scikit-learn>=1.3,<2
