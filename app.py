@@ -2588,12 +2588,13 @@ class ClasificadorSubtema:
                 frase = _recortar_frase_completa(f"{accion} de {' '.join(top[:2])}", MAX_PALABRAS_SUBTEMA)
             elif accion:
                 frase = _recortar_frase_completa(accion, MAX_PALABRAS_SUBTEMA)
-            elif top:
-                frase = _recortar_frase_completa(" ".join(top[:3]), MAX_PALABRAS_SUBTEMA)
             else:
+                # NO se concatenan palabras clave sueltas (el usuario lo rechaza explícitamente).
+                # Sin un tipo de hecho claro, se devuelve un rótulo genérico limpio.
                 frase = ""
             if _frase_esta_completa(frase) and not _es_nombre_o_fragmento_marca(frase, self.marca, self.aliases):
                 return capitalizar_etiqueta(frase)
+            return "Cobertura de información relevante"
         return "Cobertura de información relevante"
 
     def _consolidar_sinonimos_llm(self, subtemas_unicos):
@@ -2661,51 +2662,52 @@ class ClasificadorSubtema:
         ng = len(gf)
         pbar.progress(0.55, f"Fase 4 · Etiquetando {ng} grupos...")
         mapa = {}
-        sg = sorted(gf.items(), key=lambda x: x[1][0])  # orden estable por primer miembro
-
-        def _generar_etiqueta_independiente(idxs):
-            sample = idxs[:MAX_GRUPO_ETIQUETA]
-            try:
-                return self._generar_etiqueta(
-                    [textos[i] for i in sample],
-                    [titulos[i] for i in sample],
-                    [resumenes[i] for i in sample],
-                )
-            except Exception:
-                return capitalizar_etiqueta(self._fallback([titulos[i] for i in sample]))
-
-        # Etiquetado PARALELO: cada grupo genera su etiqueta de forma independiente.
-        # La unificación de noticias iguales/similares la garantizan el clustering (pasos 1-3)
-        # y aplicar_consistencia_grupos() al final del pipeline.
-        labels = {}
-        n_grupos = len(sg)
-        workers = min(int(CONCURRENT_REQUESTS), max(1, n_grupos))
-        if n_grupos > 1 and workers > 1:
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                fut = {ex.submit(_generar_etiqueta_independiente, idxs): lid for lid, idxs in sg}
-                done = 0
-                for f in as_completed(fut):
-                    lid = fut[f]
-                    labels[lid] = f.result()
-                    done += 1
-                    if done % 4 == 0 or done == n_grupos:
-                        pbar.progress(0.55 + 0.25 * (done / n_grupos), f"Etiquetando {done}/{n_grupos}...")
-        else:
-            for lid, idxs in sg:
-                labels[lid] = _generar_etiqueta_independiente(idxs)
-
-        for lid, idxs in sg:
-            for i in idxs:
-                mapa[i] = labels[lid]
-
-        # Subtemas aprobados (orden estable) para reutilizar en la reclasificación.
+        sg = sorted(gf.items(), key=lambda x: -len(x[1]))  # grupos grandes primero (revert: lógica estable)
         subtemas_aprobados = []
-        for lid, _ in sg:
-            e = labels.get(lid)
-            if e and e not in subtemas_aprobados:
-                subtemas_aprobados.append(e)
+        textos_por_subtema_aprobado = defaultdict(list)
+
+        def _generar_etiqueta_segura(idxs):
+            # Cada miembro del grupo DSU comparte la etiqueta; reutiliza los subtemas ya
+            # aprobados para que noticias equivalentes compartan EXACTAMENTE el mismo subtema.
+            sample = idxs[:MAX_GRUPO_ETIQUETA]
+            textos_grp = [textos[i] for i in sample]
+            titulos_grp = [titulos[i] for i in sample]
+            resumenes_grp = [resumenes[i] for i in sample]
+            etiqueta = self._generar_etiqueta(
+                textos_grp, titulos_grp, resumenes_grp,
+                subtemas_existentes=subtemas_aprobados
+            )
+            if etiqueta in textos_por_subtema_aprobado:
+                previos = textos_por_subtema_aprobado.get(etiqueta, [])
+                if not _grupos_contenido_compatibles(
+                    textos_grp, previos, etiqueta, etiqueta,
+                    min_sim=max(u['sim_minima_agrupacion'], 0.88), min_overlap=0.24,
+                ):
+                    rechazada = etiqueta
+                    etiqueta = self._generar_etiqueta(
+                        textos_grp, titulos_grp, resumenes_grp,
+                        subtemas_existentes=subtemas_aprobados,
+                        evitar_etiqueta=rechazada
+                    )
+                    if etiqueta in textos_por_subtema_aprobado:
+                        previos2 = textos_por_subtema_aprobado.get(etiqueta, [])
+                        if not _grupos_contenido_compatibles(
+                            textos_grp, previos2, etiqueta, etiqueta,
+                            min_sim=max(u['sim_minima_agrupacion'], 0.88), min_overlap=0.24,
+                        ):
+                            etiqueta = capitalizar_etiqueta(self._fallback(titulos_grp))
+            if etiqueta not in subtemas_aprobados:
+                subtemas_aprobados.append(etiqueta)
+            textos_por_subtema_aprobado[etiqueta].extend(textos_grp)
+            return etiqueta
+
+        for k, (lid, idxs) in enumerate(sg):
+            if k % 10 == 0: pbar.progress(0.55 + 0.25 * (k / max(ng, 1)), f"Etiquetando {k + 1}/{ng}...")
+            e = _generar_etiqueta_segura(idxs)
+            for i in idxs: mapa[i] = e
 
         subtemas = [mapa.get(i, "Varios") for i in range(n)]
+
 
 
         pbar.progress(0.80, "Fase 4b · Coherencia (sin reasignar)...")
