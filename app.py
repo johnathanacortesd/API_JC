@@ -29,6 +29,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 import html
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ======================================
 # Configuración general
@@ -40,8 +41,23 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+def _resolver_modelo_clasificacion():
+    """Modelo de clasificación configurable sin redeploy.
+    Orden: env OPENAI_CLASIF_MODEL → secret OPENAI_CLASIF_MODEL → gpt-4.1-nano por defecto.
+    (gpt-5-nano-2025-08-07 NO es fiable con esta pila: subtemas 'X de Y' y tono todo Neutro.)"""
+    env = os.environ.get("OPENAI_CLASIF_MODEL")
+    if env:
+        return env
+    try:
+        s = st.secrets.get("OPENAI_CLASIF_MODEL")
+        if s:
+            return s
+    except Exception:
+        pass
+    return "gpt-4.1-nano-2025-04-14"
+
 OPENAI_MODEL_EMBEDDING     = "text-embedding-3-small"
-OPENAI_MODEL_CLASIFICACION = "gpt-4.1-nano-2025-04-14"
+OPENAI_MODEL_CLASIFICACION = _resolver_modelo_clasificacion()
 
 CONCURRENT_REQUESTS          = 50
 SIMILARITY_THRESHOLD_TONO    = 0.94
@@ -106,6 +122,37 @@ _TRAILING_INCOMPLETE = {
     "a","ha","he","ser","estar","haber","hacer","tener","poder","deber",
     "ir","dar","ver","saber","querer","llegar","pasar","decir","poner",
 }
+
+_VERBOS_LEAD_SUBTEMA = {
+    "levanta", "levantan", "levantaron", "levanto", "impacta", "impactan", "impacto",
+    "encarece", "encarecen", "encarecio", "sube", "suben", "subio", "baja", "bajan",
+    "bajaron", "bajo", "aumenta", "aumentan", "aumento", "aumentaron", "crece", "crecen",
+    "crecio", "crecieron", "gana", "ganan", "gano", "ganaron", "pierde", "pierden",
+    "perdio", "pierden", "logra", "logran", "logro", "busca", "buscan", "busco",
+    "ofrece", "ofrecen", "ofrecio", "entrega", "entregan", "entrego", "abre", "abren",
+    "abrio", "vende", "venden", "vendio", "anuncia", "anuncian", "presenta", "presentan",
+    "inaugura", "inauguran", "lanza", "lanzan", "firma", "firman", "solicita", "solicitan",
+    "reconoce", "reconocen", "conquista", "conquistan", "inicia", "inician", "llega",
+    "llegan", "supera", "superan", "alcanza", "alcanzan", "derrumba", "derrumban",
+    "colapsa", "colapsan", "recupera", "recuperan", "avanza", "avanzan", "consolida",
+    "consolidan", "espera", "esperan", "planea", "planean", "prepara", "preparan",
+}
+
+_RE_VERBO_SUBTEMA = re.compile(
+    r'\b(presenta|presentan|anuncia|anuncian|lanza|lanzan|inaugura|inauguran|'
+    r'realiza|realizan|desarrolla|desarrollan|ejecuta|ejecutan|gestiona|gestionan|'
+    r'impulsa|impulsan|promueve|promueven|lidera|lideran|encabeza|encabezan|'
+    r'aprueba|aprueban|firma|firman|suscribe|suscriben|invierte|invierten|'
+    r'construye|construyen|instala|instalan|entrega|entregan|recibe|reciben|'
+    r'solicita|solicitan|visita|visitan|atiende|atienden|destaca|destacan|'
+    r'señala|señalan|indica|indican|expresa|expresan|afirma|afirman|'
+    r'propone|proponen|pide|piden|exige|exigen|apoya|apoyan|'
+    r'informa|informan|reporta|reportan|advierte|advierten|'
+    r'levanta|levantan|levantaron|levanto|impacta|impactan|encarece|encarecen|'
+    r'encarecio|sube|suben|subio|baja|bajan|bajaron|gano|ganan|ganaron|'
+    r'pierde|pierden|perdio|logra|logran|busca|buscan|crece|crecen|'
+    r'aumenta|aumentan|conquista|conquistan|derrumba|derrumban|recupera|recuperan)\b',
+    re.IGNORECASE)
 
 _PATRON_TITULAR = re.compile(
     r"^(nuevo|nueva|anuncia|lanza|presenta|inaugura|llega|abre|inicia|"
@@ -979,60 +1026,113 @@ def _safe_filename_part(value):
     cleaned = re.sub(r'[^A-Za-z0-9_-]+', '_', unidecode(str(value or '')).strip())
     return cleaned.strip('_') or 'marca'
 
-def _brand_audit(titulo, resumen, marca, aliases):
-    d = extraer_contexto_marca_detallado(titulo, resumen, marca, aliases)
+_TERMINAL_PUNCT = re.compile(r'[.!?…]')
+MIN_PALABRAS_CONTEXTO = 10
+MAX_CONTEXTO_CHARS = 1800
+
+def _texto_hasta_terminal(texto, n=1):
+    """Recorta 'texto' para que termine justo tras el enésimo signo de cierre (punto)."""
+    if not texto:
+        return ""
+    for m in _TERMINAL_PUNCT.finditer(texto):
+        n -= 1
+        if n == 0:
+            return texto[:m.end()].strip(" \n\t")
+    return texto.strip(" \n\t")
+
+def _contexto_para_excel(contexto, max_chars=900, umbral_corto=127):
+    """Paso final de limpieza del 'Contexto analizado' para el Excel: recorta el
+    párrafo completo hasta el PRIMER punto; si ese tramo queda < umbral_corto car.,
+    extiende hasta el SEGUNDO punto. Tope ~max_chars."""
+    if not contexto:
+        return ""
+    texto = str(contexto).strip()
+    tramo = _texto_hasta_terminal(texto, n=1)
+    if 0 < len(tramo) < umbral_corto:
+        ampliada = _texto_hasta_terminal(texto, n=2)
+        if len(ampliada) > len(tramo):
+            tramo = ampliada
+    if len(tramo) > max_chars:
+        tramo = tramo[:max_chars].rstrip()
+    return tramo.strip()
+
+def _construir_texto_basico(row, tc, sc, bn, al):
+    """Texto base de análisis: prioridad Título → Contexto analizado → Resumen-Aclaración,
+    con el CONTEXTO AMPLIO (párrafo completo de la marca, hasta ~1500 car)."""
+    titulo = str(row.get(tc, "") or "").strip()
+    resumen = str(row.get(sc, "") or "").strip()[:300]
+    ctx = extraer_contexto_marca(row.get(tc, ""), row.get(sc, ""), bn, al, row.get("Cuerpo Completo"))
+    if ctx:
+        ctx = ctx[:1500]
+    return f"{titulo}. {titulo}. {ctx}. {resumen}".strip(" .")
+
+def _extraer_parrafo_marca(fuente, marca, aliases):
+    """Contexto estructurado: inicio del párrafo → punto final del párrafo completo.
+    Si el tramo queda muy corto (< MIN_PALABRAS_CONTEXTO), se extiende hasta el
+    segundo punto del texto siguiente (regla: 'a punto final, o al segundo punto
+    si el texto es muy corto')."""
+    parrafos = [p.strip() for p in re.split(r'\n+', fuente) if p and p.strip()]
+    if not parrafos:
+        parrafos = [fuente.strip()]
+    con_hits = [i for i, p in enumerate(parrafos) if _menciona_marca_o_alias(p, marca, aliases)]
+    if not con_hits:
+        return ""
+    i = con_hits[0]  # primer párrafo que menciona la marca
+    # Tramo primario: párrafo completo, desde su inicio hasta su punto final.
+    tramo = parrafos[i]
+    palabras = len(tramo.split())
+    # Si el párrafo quedó muy corto, ampliar con el texto siguiente hasta el 2º punto.
+    if palabras < MIN_PALABRAS_CONTEXTO:
+        partes = [tramo]
+        for j in range(i + 1, len(parrafos)):
+            partes.append(_texto_hasta_terminal(parrafos[j], n=2))
+            tramo = " ".join(p for p in partes if p).strip()
+            if len(tramo.split()) >= MIN_PALABRAS_CONTEXTO:
+                break
+    return tramo[:MAX_CONTEXTO_CHARS]
+
+def _brand_audit(titulo, resumen, marca, aliases, cuerpo=None):
+    d = extraer_contexto_marca_detallado(titulo, resumen, marca, aliases, cuerpo)
     return d['contexto'], d['coincidencia'], d['origen']
 
-def extraer_contexto_marca(titulo, resumen, marca, aliases=None, ventana=320):
-    """Título + resumen si la marca/alias aparece. No recortar tanto como para perder 'ganadores'."""
-    titulo = str(titulo or "").strip()
-    resumen = str(resumen or "").strip()
-    texto = f"{titulo}. {resumen}".strip(" .")
-    if not texto or not marca or not _menciona_marca_o_alias(texto, marca, aliases):
+def extraer_contexto_marca(titulo, resumen, marca, aliases=None, cuerpo=None, ventana=320):
+    """Contexto analizado de la marca: párrafo completo desde su inicio hasta su
+    punto final. Prioridad de fuentes: Cuerpo Completo → Resumen → Título. Si el
+    tramo queda muy corto, extiende hasta el segundo punto del texto siguiente."""
+    titulo   = clean_text(str(titulo or "")).strip()
+    resumen  = clean_text(str(resumen or "")).strip()
+    cuerpo   = clean_text(str(cuerpo or "")).strip()
+    if not marca:
         return ""
-    partes = re.split(r'(?<=[\.\!\?\n])\s+', texto)
-    if len(partes) <= 1:
-        partes = re.split(r'\n+', texto)
-    hits = [p.strip() for p in partes if p.strip() and _menciona_marca_o_alias(p, marca, aliases)]
-    # Siempre incluir el título: ahí suele estar "ganadores" / el hecho.
-    bloques = []
-    if titulo:
-        bloques.append(titulo)
-    bloques.extend(hits)
-    # Never append the complete summary: sentiment must stay centered on the brand.
-    if hits and len(" ".join(hits).split()) < 12:
-        all_parts = [p.strip() for p in partes if p.strip()]
-        for hit in hits:
-            try:
-                pos = all_parts.index(hit)
-                if pos and all_parts[pos - 1] not in bloques:
-                    bloques.insert(0, all_parts[pos - 1])
-                elif pos + 1 < len(all_parts) and all_parts[pos + 1] not in bloques:
-                    bloques.append(all_parts[pos + 1])
-            except ValueError:
-                pass
-    vistos, out = set(), []
-    for h in bloques:
-        k = _normalizar_mencion(h)
-        if k and k not in vistos:
-            vistos.add(k)
-            out.append(h)
-    return " ".join(out)[:1800] if out else texto[:1800]
+    fuentes = []
+    if cuerpo:   fuentes.append(cuerpo)
+    if resumen:  fuentes.append(resumen)
+    if titulo:   fuentes.append(titulo)
+    fuente = ""
+    for f in fuentes:
+        if _menciona_marca_o_alias(f, marca, aliases):
+            fuente = f
+            break
+    if not fuente:
+        return ""
+    return _extraer_parrafo_marca(fuente, marca, aliases)
 
-def extraer_contexto_marca_detallado(titulo, resumen, marca, aliases=None):
+def extraer_contexto_marca_detallado(titulo, resumen, marca, aliases=None, cuerpo=None):
     """Return auditable brand match metadata for sentiment analysis."""
     titulo, resumen = str(titulo or "").strip(), str(resumen or "").strip()
+    cuerpo = str(cuerpo or "").strip()
     nombres = _variantes_marca(marca, aliases)
     title_hit = _menciona_marca_o_alias(titulo, marca, aliases)
     summary_hit = _menciona_marca_o_alias(resumen, marca, aliases)
-    if not title_hit and not summary_hit:
+    body_hit = bool(cuerpo) and _menciona_marca_o_alias(cuerpo, marca, aliases)
+    if not title_hit and not summary_hit and not body_hit:
         return {"contexto": "", "marca_encontrada": "No", "origen": "", "coincidencia": ""}
-    origen = ", ".join(x for x, ok in (("Título", title_hit), ("Resumen", summary_hit)) if ok)
-    source = f"{titulo}. {resumen}".strip(" .")
+    origen = ", ".join(x for x, ok in (("Título", title_hit), ("Resumen", summary_hit), ("Cuerpo", body_hit)) if ok)
+    source = f"{titulo}. {resumen}. {cuerpo}".strip(" .")
     source_norm = _normalizar_mencion(source)
     matched = next((n for n in nombres if _coincide_nombre_completo(source_norm, n)), marca)
     return {
-        "contexto": extraer_contexto_marca(titulo, resumen, marca, aliases),
+        "contexto": extraer_contexto_marca(titulo, resumen, marca, aliases, cuerpo),
         "marca_encontrada": "Sí", "origen": origen, "coincidencia": matched,
     }
 
@@ -1062,7 +1162,7 @@ def _validar_etiqueta_completa(etiqueta, titulos_grp=None, resumenes_grp=None, m
                 openai.ChatCompletion.create,
                 model=OPENAI_MODEL_CLASIFICACION,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=80,
+                max_tokens=200,
                 temperature=0.1,
                 response_format={"type": "json_object"}
             )
@@ -1240,7 +1340,7 @@ def _unificar_subtemas_llm(subtemas_a_unificar, textos_por_subtema, marca, alias
             openai.ChatCompletion.create,
             model=OPENAI_MODEL_CLASIFICACION,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=60,
+            max_tokens=160,
             temperature=0.05,
             response_format={"type": "json_object"}
         )
@@ -1404,6 +1504,97 @@ def aplicar_consistencia_grupos(df, titulo_col, resumen_col,
             lambda x: capitalizar_etiqueta(_recortar_frase_completa(str(x), MAX_PALABRAS_SUBTEMA))
             if str(x).strip().lower() not in {"", "nan", "n/a", "-"} else x
         )
+
+    # ── Unificación determinista: noticias idénticas o casi idénticas ⇒ MISMO subtema y tema ──
+    # Evita que dos noticias iguales/similares (mismo titular, mismo contexto, o subtitulado
+    # que solo agrega/quita una oración) terminen con subtemas distintos.
+    if subtema_col in df.columns and titulo_col in df.columns:
+        n = len(df)
+        tn = [norm_key(str(x)) for x in df[titulo_col].fillna('')]
+        cn = None
+        if 'Contexto analizado' in df.columns:
+            cn = [norm_key(str(x)) for x in df['Contexto analizado'].fillna('')]
+        rn = [norm_key(str(x)) for x in df[resumen_col].fillna('')] if resumen_col in df.columns else None
+        parent = list(range(n))
+
+        def _fa(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        for i in range(n):
+            if not tn[i]:
+                continue
+            ti = tn[i]
+            for j in range(i + 1, n):
+                tj = tn[j]
+                if not tj:
+                    continue
+                igual = (ti == tj)
+                if not igual and len(ti) >= 10 and len(tj) >= 10:
+                    igual = (ti in tj or tj in ti)          # mismo titular, con/sin subtítulo
+                if not igual and SequenceMatcher(None, ti, tj).ratio() >= 0.88:
+                    igual = True
+                if not igual and rn and rn[i] and rn[j] \
+                        and SequenceMatcher(None, ti, tj).ratio() >= 0.80 \
+                        and SequenceMatcher(None, rn[i], rn[j]).ratio() >= 0.70:
+                    igual = True                            # título parecido Y cuerpo parecido
+                if not igual and cn and cn[i] and cn[i] == cn[j]:
+                    igual = True                            # mismo "Contexto analizado"
+                if igual:
+                    ri, rj = _fa(i), _fa(j)
+                    if ri != rj:
+                        parent[rj] = ri
+
+        # Agrupación SEMÁNTICA: noticias del MISMO hecho aunque títulos/cuerpos difieran
+        # (el sistema ya las detectó como un mismo grupo en "Grupo noticia"). Unificarlas.
+        if 'Grupo noticia' in df.columns:
+            por_grupo = defaultdict(list)
+            for i in range(n):
+                g = str(df.iloc[i].get('Grupo noticia') or "").strip()
+                if g and g.lower() not in ("", "nan", "none"):
+                    por_grupo[g].append(i)
+            for idxs in por_grupo.values():
+                if len(idxs) < 2:
+                    continue
+                base = _fa(idxs[0])
+                for k in idxs[1:]:
+                    parent[_fa(k)] = base
+
+        grupos = defaultdict(list)
+        for i in range(n):
+            grupos[_fa(i)].append(i)
+
+        for idxs in grupos.values():
+            if len(idxs) < 2:
+                continue
+            subs = [str(df.iloc[i][subtema_col]) for i in idxs
+                    if str(df.iloc[i][subtema_col] or "").strip() not in ("", "-", "nan", "None")]
+            subs = [s for s in subs if s and s.lower() != "nan"]
+            if not subs:
+                continue
+            order = []
+            for s in subs:
+                if s not in order:
+                    order.append(s)
+            freq = {s: subs.count(s) for s in order}
+            canon = max(order, key=lambda s: (freq[s], -order.index(s)))
+            for i in idxs:
+                df.at[df.index[i], subtema_col] = capitalizar_etiqueta(canon)
+            if tema_col in df.columns:
+                ts = [str(df.iloc[i][tema_col]) for i in idxs
+                      if str(df.iloc[i][tema_col] or "").strip() not in ("", "-", "nan", "None")]
+                ts = [t for t in ts if t and t.lower() != "nan"]
+                if ts:
+                    ordt = []
+                    for t in ts:
+                        if t not in ordt:
+                            ordt.append(t)
+                    freqt = {t: ts.count(t) for t in ordt}
+                    canon_t = max(ordt, key=lambda t: (freqt[t], -ordt.index(t)))
+                    for i in idxs:
+                        df.at[df.index[i], tema_col] = capitalizar_etiqueta(canon_t)
     return df
 
 
@@ -1442,15 +1633,19 @@ class ClasificadorTono:
                 f"🔴 NEGATIVO: un hecho perjudica, cuestiona o expone directamente a '{self.marca}' "
                 f"(demandas, multas, fraudes, fallas propias, quejas, investigaciones, pérdidas o retiro de productos).\n"
                 f"🟢 POSITIVO: el hecho acredita directamente un logro, mejora o aporte verificable de '{self.marca}' "
-                f"(premio, crecimiento, lanzamiento exitoso, inversión realizada, innovación, expansión o reconocimiento).\n"
+                f"(premio, crecimiento, lanzamiento exitoso, inversión realizada, innovación, expansión o reconocimiento). "
+                f"También es POSITIVO si '{self.marca}' expresa SOLIDARIDAD o respaldo, emite un comunicado de apoyo humanitario, "
+                f"dona, ayuda a comunidades/afectados tras una crisis o se pronuncia apoyando a su sector. "
+                f"Un comunicado o muestra de solidaridad de la marca NUNCA es Neutro: refuerza su imagen pública.\n"
                 f"⚪ NEUTRO: La marca se menciona SIN impacto a su imagen. Ejemplos:\n"
                 f"  - La noticia habla de una crisis del sector/país, pero la marca solo es mencionada informando o adaptándose.\n"
                 f"  - Se menciona a la marca de paso, sin rol (no aplica si es ganadora, premiada o protagonista).\n"
                 f"  - Una persona, autoridad, proveedor o tercero es quien recibe el efecto positivo o negativo.\n"
-                f"  - Emite un comunicado regular sin evidencia de crisis ni logro relevante.\n"
+                f"  - Emite un comunicado puramente rutinario/informativo SIN solidaridad, ayuda ni logro (p. ej. cambio de horario, cierre de oficina).\n"
                 f"  - Critica, denuncia o advierte sobre un problema de terceros o del sector; la crítica de la marca NO es una crítica contra la marca.\n\n"
                 f"⚠️ ATENCIÓN: Ignora el tono del sector o de terceros. Evalúa ÚNICAMENTE cómo el hecho afecta "
-                f"la reputación corporativa de '{self.marca}': mejora (Positivo), empeora (Negativo) o no cambia (Neutro).\n\n"
+                f"la reputación corporativa de '{self.marca}': mejora (Positivo), empeora (Negativo) o no cambia (Neutro). "
+                f"Recordatorio: solidaridad, comunicados de respaldo y ayuda humanitaria de la marca = POSITIVO, nunca Neutro.\n\n"
                 f'Responde ÚNICAMENTE con JSON: {{"tono":"Positivo|Negativo|Neutro", '
                 f'"confianza":"Alta|Media|Baja", "justificacion":"explicación concreta de máximo 35 palabras"}}'
             )
@@ -1460,7 +1655,7 @@ class ClasificadorTono:
                     openai.ChatCompletion.acreate,
                     model=OPENAI_MODEL_CLASIFICACION,
                     messages=[{"role": "user", "content": prompt}],
-                    max_tokens=100,
+                    max_tokens=300,
                     temperature=0.0,
                     response_format={"type": "json_object"}
                 )
@@ -1483,7 +1678,7 @@ class ClasificadorTono:
             except Exception as e:
                 return {"tono": "Neutro", "confianza": "Baja", "justificacion": "Error de clasificación", "evidencia": eval_txt[:1800]}
 
-    async def procesar_lote_async(self, textos, pbar, resumenes, titulos):
+    async def procesar_lote_async(self, textos, pbar, resumenes, titulos, cuerpos=None):
         n = len(textos)
         txts = textos.tolist()
         pbar.progress(0.05, "Agrupando noticias para análisis de tono...")
@@ -1509,7 +1704,10 @@ class ClasificadorTono:
                 
         grupos = dsu.grupos(n)
         contextos = [
-            extraer_contexto_marca(str(titulos.iloc[i]), str(resumenes.iloc[i]), self.marca, self.aliases)
+            extraer_contexto_marca(
+                str(titulos.iloc[i]), str(resumenes.iloc[i]), self.marca, self.aliases,
+                cuerpos.iloc[i] if cuerpos is not None else None
+            )
             for i in range(n)
         ]
         reps = {}
@@ -1591,8 +1789,27 @@ def _propagar_tono_equivalentes(tonos, titulos, resumenes):
                 out[i] = canon
     return out
 
-def analizar_tono_con_pkl(textos, pkl_file, titulos=None, resumenes=None, marca="", aliases=None):
+def _predict_pkl_in_batches(pipeline, textos, progress=None, batch_size=64):
+    """Run sklearn PKL inference in bounded batches so Streamlit can show progress."""
+    values = list(textos)
+    if not values:
+        return []
+    predictions = []
+    total = len(values)
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        predictions.extend(pipeline.predict(values[start:end]))
+        if progress is not None:
+            progress.progress(end / total, f"Prediciendo PKL {end}/{total}")
+    return predictions
+
+
+def analizar_tono_con_pkl(textos, pkl_file, titulos=None, resumenes=None, marca="", aliases=None, progress=None, cuerpos=None):
     try:
+        if progress is not None:
+            progress.progress(0.02, "Cargando modelo PKL...")
+        if hasattr(pkl_file, "seek"):
+            pkl_file.seek(0)
         pipeline = joblib.load(pkl_file)
         TM = {
             1: "Positivo", "1": "Positivo", "positivo": "Positivo", "Positivo": "Positivo",
@@ -1610,7 +1827,7 @@ def analizar_tono_con_pkl(textos, pkl_file, titulos=None, resumenes=None, marca=
             n = len(titulos)
             snippets, flags = [], []
             for i in range(n):
-                ctx = extraer_contexto_marca(titulos[i], resumenes[i], marca, aliases)
+                ctx = extraer_contexto_marca(titulos[i], resumenes[i], marca, aliases, cuerpos[i] if cuerpos is not None else None)
                 if ctx:
                     tit = str(titulos[i] or "").strip()
                     snippet = ctx if (tit and ctx.lower().startswith(tit[:20].lower())) else (f"{tit}. {ctx}" if tit else ctx)
@@ -1622,14 +1839,14 @@ def analizar_tono_con_pkl(textos, pkl_file, titulos=None, resumenes=None, marca=
             result = [{"tono": "Neutro"}] * n
             idx_pred = [i for i, f in enumerate(flags) if f]
             if idx_pred:
-                preds = pipeline.predict([snippets[i] for i in idx_pred])
+                preds = _predict_pkl_in_batches(pipeline, [snippets[i] for i in idx_pred], progress)
                 for i, p in zip(idx_pred, preds):
                     result[i] = {"tono": _norm_pred(p)}
             if titulos is not None and resumenes is not None:
                 tonos = _propagar_tono_equivalentes([r["tono"] for r in result], list(titulos), list(resumenes))
                 return [{"tono": t} for t in tonos]
             return result
-        preds = [{"tono": _norm_pred(p)} for p in pipeline.predict(textos)]
+        preds = [{"tono": _norm_pred(p)} for p in _predict_pkl_in_batches(pipeline, textos, progress)]
         if titulos is not None and resumenes is not None:
             tonos = _propagar_tono_equivalentes([r["tono"] for r in preds], list(titulos), list(resumenes))
             return [{"tono": t} for t in tonos]
@@ -1910,7 +2127,9 @@ class ClasificadorSubtema:
         prompt = (
             f"Eres analista de reputación de la marca principal '{self.marca}'. "
             "Genera UN subtema periodístico (3-5 palabras) que sea una FRASE NOMINAL "
-            "— sin sujeto ni verbo conjugado — para este grupo de noticias.\n\n"
+            "— sin sujeto ni verbo conjugado — para este grupo de noticias. "
+            "Si el hecho NO está vinculado con la marca, describe el tema real de la noticia "
+            "y NO fuerces una relación con la marca.\n\n"
             "TÍTULOS:\n" + "\n".join(f"  · {t}" for t in tm)
             + ctx_resumenes
             + f"\n\nPALABRAS CLAVE: {kw}"
@@ -1945,18 +2164,29 @@ class ClasificadorSubtema:
             r'solicita|solicitan|visita|visitan|atiende|atienden|destaca|destacan|'
             r'señala|señalan|indica|indican|expresa|expresan|afirma|afirman|'
             r'propone|proponen|pide|piden|exige|exigen|apoya|apoyan|'
-            r'informa|informan|reporta|reportan|advierte|advierten)\b',
+            r'informa|informan|reporta|reportan|advierte|advierten|'
+            r'levanta|levantan|levantaron|levanto|impacta|impactan|encarece|encarecen|'
+            r'encarecio|sube|suben|subio|baja|bajan|bajaron|gano|ganan|ganaron|'
+            r'pierde|pierden|perdio|logra|logran|busca|buscan|crece|crecen|'
+            r'aumenta|aumentan|conquista|conquistan|derrumba|derrumban|recupera|recuperan)\\b',
             re.IGNORECASE
         )
 
         def _tiene_verbo_conjugado(s): return bool(_VERBOS_FRASES.search(s))
+
+        def _primera_palabra_verbo(s):
+            prim = unidecode((s or "").strip().lower() or "").split()
+            if not prim:
+                return False
+            p0 = prim[0].rstrip(".,!?;:")
+            return p0 in _VERBOS_LEAD_SUBTEMA or bool(_RE_VERBO_SUBTEMA.search(p0))
 
         try:
             resp = call_with_retries(
                 openai.ChatCompletion.create,
                 model=OPENAI_MODEL_CLASIFICACION,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=60,
+                max_tokens=180,
                 temperature=0.0,
                 response_format={"type": "json_object"}
             )
@@ -1985,7 +2215,9 @@ class ClasificadorSubtema:
 
             genericas = {"gestión", "gestion", "actividades", "acciones", "noticias",
                          "información", "informacion", "eventos", "varios", "sin tema",
-                         "actividad corporativa", "gestion corporativa"}
+                         "actividad corporativa", "gestion corporativa",
+                         "impacto en la reputacion", "impacto reputacional",
+                         "reputacion corporativa", "impacto corporativo"}
             es_gen = string_norm_label(et) in {string_norm_label(g) for g in genericas}
             es_solo_marca = _es_nombre_o_fragmento_marca(et, self.marca, self.aliases)
             es_rob = _es_robotico(et)
@@ -1997,6 +2229,12 @@ class ClasificadorSubtema:
                 et = self._refinar(tm, kw, rm, forzar_preposicion=True)
                 if not _validar_estructura_subtema(et):
                     et = self._fallback(titulos_grp)
+
+            # REFUERZO anti-frases-sin-sentido: verbo conjugado / verbo al inicio / robotica
+            if _tiene_verbo_conjugado(et) or _primera_palabra_verbo(et) or _es_robotico(et):
+                et = self._refinar(tm, kw, rm, forzar_preposicion=True, prohibir_verbos=True)
+            if _tiene_verbo_conjugado(et) or _primera_palabra_verbo(et):
+                et = self._fallback(titulos_grp)
 
             et = _validar_etiqueta_completa(
                 et, titulos_grp=titulos_grp, resumenes_grp=resumenes_grp,
@@ -2055,7 +2293,7 @@ class ClasificadorSubtema:
                 openai.ChatCompletion.create,
                 model=OPENAI_MODEL_CLASIFICACION,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=60,
+                max_tokens=180,
                 temperature=0.2,
                 response_format={"type": "json_object"}
             )
@@ -2085,14 +2323,17 @@ class ClasificadorSubtema:
         accion = next((nombre for patron, nombre in acciones if re.search(patron, norm_total)), None)
         palabras = []
         tokens_marca = set(_normalizar_mencion(" ".join([self.marca] + self.aliases)).split())
-        excluir = tokens_marca | STOPWORDS_ES | {
+        excluir = tokens_marca | STOPWORDS_ES | _VERBOS_LEAD_SUBTEMA | {
             "universidad", "empresa", "compania", "corporacion", "fundacion", "institucion",
             "anuncio", "anuncia", "anuncio", "lanzamiento", "lanza", "presenta", "presencia",
             "invitado", "especial", "principal", "marca", "cliente",
+            "ultimo", "ultima", "ultimos", "ultimas", "nuevo", "nueva", "nuevos", "nuevas",
+            "poder", "suerte", "gran", "grande", "grandes", "coccion", "lenta", "medio",
+            "parte", "manera", "forma", "tipo", "asi", "pues", "mismo", "misma",
         }
         for t in titulos[:5]:
             for w in string_norm_label(t).split():
-                if len(w) >= 4 and w not in excluir: palabras.append(w)
+                if len(w) >= 4 and w not in excluir and not _RE_VERBO_SUBTEMA.search(w): palabras.append(w)
         if palabras:
             top = [w for w, _ in Counter(palabras).most_common(3)]
             if accion:
@@ -2150,7 +2391,7 @@ class ClasificadorSubtema:
             f"Sim mínima: **{u['sim_minima_agrupacion']}**"
         )
 
-        et = [texto_para_embedding(titulos[i], resumenes[i]) for i in range(n)]
+        et = textos  # base de agrupación: Título+Contexto+Resumen (ya en `col` = _txt)
 
         pbar.progress(0.05, "Fase 1 · Idénticas...")
         dsu = DSU(n)
@@ -2358,7 +2599,8 @@ def _generar_nombre_tema_llm(subtemas_grupo, textos_muestra, titulos_muestra, ma
     tit_muestra = "\n".join(f"  · {t[:100]}" for t in list(dict.fromkeys(titulos_muestra))[:5])
     prompt = (
         f"Eres analista de reputación de la marca principal '{marca}'. "
-        "Crea UN tema editorial preciso (2-5 palabras) que agrupe estos subtemas y describa el ámbito del hecho relacionado con la marca.\n\n"
+        "Crea UN tema editorial preciso (2-5 palabras) que agrupe estos subtemas y describa el ámbito del hecho. "
+        "Si el hecho NO está vinculado con la marca, crea el tema real de la noticia; NO lo fuerces a la marca ni a su sector.\n\n"
         "SUBTEMAS:\n" + subs_list + "\n\nTÍTULOS DE REFERENCIA:\n" + tit_muestra +
         f"\n\nKEYWORDS: {kw}\n\n"
         "REGLAS ESTRICTAS:\n"
@@ -2376,7 +2618,7 @@ def _generar_nombre_tema_llm(subtemas_grupo, textos_muestra, titulos_muestra, ma
             openai.ChatCompletion.create,
             model=OPENAI_MODEL_CLASIFICACION,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=40,
+            max_tokens=120,
             temperature=0.05,
             response_format={"type": "json_object"}
         )
@@ -2401,7 +2643,7 @@ def _regenerar_tema_diferente(subtemas_grupo, titulos_muestra, intento=0):
             openai.ChatCompletion.create,
             model=OPENAI_MODEL_CLASIFICACION,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=50,
+            max_tokens=120,
             temperature=0.2 + intento * 0.1,
             response_format={"type": "json_object"}
         )
@@ -2496,8 +2738,8 @@ def consolidar_temas(subtemas, textos, pbar, marca=""):
     mt = {}
     tc = len(clusters)
     pbar.progress(0.50, f"Nombres {tc} temas...")
-    for k, (cid, subtemas_cluster) in enumerate(clusters.items()):
-        pbar.progress(0.50 + 0.35 * (k / max(tc, 1)), f"Tema {k + 1}/{tc}...")
+    # Nombrado por cluster es INDEPENDIENTE → se paraleliza para acelerar (21 noticias).
+    def _nombrar_cluster(cid, subtemas_cluster):
         titulos_cluster = []
         textos_cluster = []
         for sub in subtemas_cluster:
@@ -2532,8 +2774,26 @@ def consolidar_temas(subtemas, textos, pbar, marca=""):
             if not _frase_esta_completa(nombre):
                 freq = Counter(subtemas)
                 nombre = _recortar_frase_completa(max(subtemas_cluster, key=lambda s: freq.get(s, 0)), max_palabras=4)
-        nombre = capitalizar_etiqueta(nombre)
-        for sub in subtemas_cluster: mt[sub] = nombre
+        return {sub: capitalizar_etiqueta(nombre) for sub in subtemas_cluster}
+
+    workers = min(int(CONCURRENT_REQUESTS), tc or 1)
+    if workers > 1 and tc > 1:
+        futuras = {}
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for cid, subs in clusters.items():
+                futuras[ex.submit(_nombrar_cluster, cid, subs)] = cid
+            done = 0
+            for f in as_completed(futuras):
+                try:
+                    for sub, nombre in f.result().items(): mt[sub] = nombre
+                except Exception:
+                    pass
+                done += 1
+                pbar.progress(0.50 + 0.35 * (done / max(tc, 1)), f"Tema {done}/{tc}...")
+    else:
+        for k, (cid, subtemas_cluster) in enumerate(clusters.items()):
+            pbar.progress(0.50 + 0.35 * (k / max(tc, 1)), f"Tema {k + 1}/{tc}...")
+            for sub, nombre in _nombrar_cluster(cid, subtemas_cluster).items(): mt[sub] = nombre
     for sub in uc: mt[sub] = capitalizar_etiqueta(sub)
 
     pbar.progress(0.87, "Validando pertenencia mínima a temas...")
@@ -2890,8 +3150,9 @@ def generate_output_excel(rows, km):
     col_idx_map = {name: ORDER.index(name) + 1 for name in ORDER}
         
     for row in rows:
-        ctx, match, origin = _brand_audit(row.get(km.get("titulo"), ""), row.get(km.get("resumen"), ""), st.session_state.get("brand_name", ""), st.session_state.get("brand_aliases", []))
-        row["Contexto analizado"], row["Coincidencia marca"], row["Origen coincidencia"] = ctx, match, origin
+        ctx, match, origin = _brand_audit(row.get(km.get("titulo"), ""), row.get(km.get("resumen"), ""), st.session_state.get("brand_name", ""), st.session_state.get("brand_aliases", []), row.get("Cuerpo Completo"))
+        row["Contexto analizado"] = _contexto_para_excel(ctx)
+        row["Coincidencia marca"], row["Origen coincidencia"] = match, origin
         tk = km.get("titulo")
         if tk and tk in row: row[tk] = clean_title_for_output(row.get(tk))
         rk = km.get("resumen")
@@ -3055,7 +3316,7 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
     if ta:
         df = pd.DataFrame(ta)
         df["_txt"] = df.apply(
-            lambda r: texto_para_embedding(str(r.get(km["titulo"], "")), str(r.get(km["resumen"], ""))),
+            lambda r: _construir_texto_basico(r, km["titulo"], km["resumen"], bn, ba),
             axis=1
         )
         with st.status("Embeddings...", expanded=True) as s:
@@ -3068,12 +3329,14 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
                 res = analizar_tono_con_pkl(
                     df["_txt"].tolist(), tpkl,
                     titulos=df[km["titulo"]], resumenes=df[km["resumen"]],
-                    marca=bn, aliases=ba,
+                    marca=bn, aliases=ba, progress=pb,
+                    cuerpos=df['Cuerpo Completo'] if 'Cuerpo Completo' in df.columns else None,
                 )
                 if res is None: st.stop()
             elif "API" in mode or "Híbrido" in mode:
                 res = await ClasificadorTono(bn, ba).procesar_lote_async(
-                    df["_txt"], pb, df[km["resumen"]], df[km["titulo"]]
+                    df["_txt"], pb, df[km["resumen"]], df[km["titulo"]],
+                    df['Cuerpo Completo'] if 'Cuerpo Completo' in df.columns else None,
                 )
             else:
                 res = [{"tono": "N/A"}] * len(ta)
@@ -3129,7 +3392,7 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
 async def run_quick_async(df, tc, sc, bn, al):
     st.session_state.update({'tokens_input': 0, 'tokens_output': 0, 'tokens_embedding': 0})
     get_embedding_cache().clear()
-    df['_txt'] = df.apply(lambda r: texto_para_embedding(str(r.get(tc, "")), str(r.get(sc, ""))), axis=1)
+    df['_txt'] = df.apply(lambda r: _construir_texto_basico(r, tc, sc, bn, al), axis=1)
     with st.status("Embeddings...", expanded=True) as s:
         _ = get_embeddings_batch(df['_txt'].tolist())
         s.update(label=f"✓ {get_embedding_cache().stats()}", state="complete")
@@ -3137,8 +3400,9 @@ async def run_quick_async(df, tc, sc, bn, al):
         pb = st.progress(0)
         res = await ClasificadorTono(bn, al).procesar_lote_async(df["_txt"], pb, df[sc].fillna(''), df[tc].fillna(''))
         df['Tono IA'] = [r["tono"] for r in res]
-        audits = [_brand_audit(r.get(tc, ''), r.get(sc, ''), bn, al) for _, r in df.iterrows()]
-        df['Contexto analizado'], df['Coincidencia marca'], df['Origen coincidencia'] = zip(*audits)
+        audits = [_brand_audit(r.get(tc, ''), r.get(sc, ''), bn, al, r.get('Cuerpo Completo')) for _, r in df.iterrows()]
+        df['Contexto analizado'] = [_contexto_para_excel(a[0]) for a in audits]
+        df['Coincidencia marca'], df['Origen coincidencia'] = [a[1] for a in audits], [a[2] for a in audits]
         s.update(label="✓ Tono", state="complete")
     with st.status("Clasificación", expanded=True) as s:
         pb = st.progress(0)
@@ -3255,7 +3519,7 @@ async def run_custom_excel_async(file_bytes, tc, sc, bn, al, mode="API de OpenAI
     df = pd.read_excel(buf_in)
 
     df['_txt'] = df.apply(
-        lambda r: texto_para_embedding(str(r.get(tc, "")), str(r.get(sc, ""))),
+        lambda r: _construir_texto_basico(r, tc, sc, bn, al),
         axis=1
     )
 
@@ -3272,19 +3536,22 @@ async def run_custom_excel_async(file_bytes, tc, sc, bn, al, mode="API de OpenAI
                 df["_txt"].tolist(), tpkl,
                 titulos=df[tc].fillna(""), resumenes=df[sc].fillna(""),
                 marca=bn, aliases=al,
+                cuerpos=df['Cuerpo Completo'] if 'Cuerpo Completo' in df.columns else None,
             )
             if res is None: st.stop()
             tonos = [r["tono"] for r in res]
         elif "API" in mode or "Híbrido" in mode:
             res = await ClasificadorTono(bn, al).procesar_lote_async(
-                df["_txt"], pb, df[sc].fillna(''), df[tc].fillna('')
+                df["_txt"], pb, df[sc].fillna(''), df[tc].fillna(''),
+                df['Cuerpo Completo'] if 'Cuerpo Completo' in df.columns else None,
             )
             tonos = [r["tono"] for r in res]
         else:
             tonos = ["N/A"] * len(df)
         df['Tono IA'] = tonos
-        audits = [_brand_audit(r.get(tc, ''), r.get(sc, ''), bn, al) for _, r in df.iterrows()]
-        df['Contexto analizado'], df['Coincidencia marca'], df['Origen coincidencia'] = zip(*audits)
+        audits = [_brand_audit(r.get(tc, ''), r.get(sc, ''), bn, al, r.get('Cuerpo Completo')) for _, r in df.iterrows()]
+        df['Contexto analizado'] = [_contexto_para_excel(a[0]) for a in audits]
+        df['Coincidencia marca'], df['Origen coincidencia'] = [a[1] for a in audits], [a[2] for a in audits]
         s.update(label="✓ Tono IA evaluado", state="complete")
 
     # --- PASO 3: SUBTEMAS Y TEMAS ---
@@ -3476,7 +3743,7 @@ def render_custom_excel_tab():
 # Main
 # ======================================
 async def run_sentiment_only_async(df, title_col, summary_col, brand, aliases, pkl_file=None):
-    details = [extraer_contexto_marca_detallado(r.get(title_col, ''), r.get(summary_col, ''), brand, aliases) for _, r in df.iterrows()]
+    details = [extraer_contexto_marca_detallado(r.get(title_col, ''), r.get(summary_col, ''), brand, aliases, r.get('Cuerpo Completo')) for _, r in df.iterrows()]
     df = df.copy()
     idx = [i for i, d in enumerate(details) if d['contexto']]
     results = [{'tono':'Neutro','confianza':'Alta','justificacion':'La marca no aparece en el título ni en el resumen.'} for _ in details]
@@ -3490,7 +3757,7 @@ async def run_sentiment_only_async(df, title_col, summary_col, brand, aliases, p
     df['Tono IA'] = [r.get('tono','Neutro') for r in results]
     df['Confianza Tono'] = [r.get('confianza','Media') for r in results]
     df['Marca encontrada'] = [d['marca_encontrada'] for d in details]
-    df['Contexto analizado'] = [d['contexto'] for d in details]
+    df['Contexto analizado'] = [_contexto_para_excel(d['contexto']) for d in details]
     df['Coincidencia marca'] = [d['coincidencia'] for d in details]
     df['Origen coincidencia'] = [d['origen'] for d in details]
     return df
