@@ -13,8 +13,6 @@ import io
 import openai
 import re
 import time
-import random
-import threading
 from unidecode import unidecode
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
@@ -43,30 +41,9 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-def _secrets_get(key, default=None):
-    """Acceso seguro a st.secrets (no disponible fuera de Streamlit)."""
-    try:
-        return st.secrets.get(key, default)
-    except Exception:
-        return default
-
-def _resolver_proveedor_clasificacion():
-    """Proveedor de clasificación configurable sin redeploy.
-    Orden: env DEEPSEEK_API_KEY → secret DEEPSEEK_API_KEY → OpenAI (comportamiento actual).
-    Con DEEPSEEK_API_KEY activo, la clasificación (tono/tema/subtema) sale por el
-    endpoint OpenAI-compatible configurado (por defecto AgentRouter: https://agentrouter.org/v1,
-    que sirve deepseek-v4-flash entre otros modelos); los embeddings siguen yendo a
-    OpenAI (text-embedding-3-small)."""
-    if os.environ.get("DEEPSEEK_API_KEY"):
-        return "deepseek"
-    if _secrets_get("DEEPSEEK_API_KEY"):
-        return "deepseek"
-    return "openai"
-
 def _resolver_modelo_clasificacion():
     """Modelo de clasificación configurable sin redeploy.
-    Orden: env OPENAI_CLASIF_MODEL → secret OPENAI_CLASIF_MODEL →
-    (DeepSeek activo ? env/secret DEEPSEEK_MODEL o deepseek-v4-flash) → gpt-4.1-nano por defecto.
+    Orden: env OPENAI_CLASIF_MODEL → secret OPENAI_CLASIF_MODEL → gpt-4.1-nano por defecto.
     (gpt-5-nano-2025-08-07 NO es fiable con esta pila: subtemas 'X de Y' y tono todo Neutro.)"""
     env = os.environ.get("OPENAI_CLASIF_MODEL")
     if env:
@@ -77,83 +54,12 @@ def _resolver_modelo_clasificacion():
             return s
     except Exception:
         pass
-    if _resolver_proveedor_clasificacion() == "deepseek":
-        dm = os.environ.get("DEEPSEEK_MODEL") or _secrets_get("DEEPSEEK_MODEL")
-        if dm:
-            return dm
-        return "deepseek-v4-flash"  # servido por AgentRouter (OpenAI-compat)
     return "gpt-4.1-nano-2025-04-14"
 
-# Endpoint OpenAI-compatible del proveedor de clasificación. Por defecto AgentRouter
-# (https://agentrouter.org/v1), donde el usuario tiene su API key y sirve deepseek-v4-flash.
-DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL") or _secrets_get("DEEPSEEK_BASE_URL") or "https://agentrouter.org/v1"
-OPENAI_BASE_URL   = "https://api.openai.com/v1"
-
-PROVEEDOR_CLASIFICACION = _resolver_proveedor_clasificacion()
 OPENAI_MODEL_EMBEDDING     = "text-embedding-3-small"
 OPENAI_MODEL_CLASIFICACION = _resolver_modelo_clasificacion()
 
-# openai==0.28 lee openai.api_base / openai.api_key como GLOBALES en cada request
-# (no acepta api_base/api_key por llamada). Como clasificación y embeddings pueden
-# ir a proveedores distintos, cada llamada configura y restaura estos globales bajo lock.
-_api_config_lock = threading.Lock()
-
-def _configurar_cliente_clasificacion():
-    """Deja openai.api_key / openai.api_base listos para llamadas de CLASIFICACIÓN
-    (DeepSeek si está configurado; si no, OpenAI). Lanza KeyError si falta la key."""
-    if PROVEEDOR_CLASIFICACION == "deepseek":
-        key = os.environ.get("DEEPSEEK_API_KEY") or _secrets_get("DEEPSEEK_API_KEY")
-        if not key:
-            raise KeyError("DEEPSEEK_API_KEY no encontrada en st.secrets.")
-        openai.api_key = key
-        openai.api_base = DEEPSEEK_BASE_URL
-    else:
-        key = os.environ.get("OPENAI_API_KEY") or _secrets_get("OPENAI_API_KEY")
-        if not key:
-            raise KeyError("OPENAI_API_KEY no encontrada en st.secrets.")
-        openai.api_key = key
-        openai.api_base = OPENAI_BASE_URL
-
-def _clasificacion_llm(fn, *args, **kwargs):
-    """Ejecuta una llamada de clasificación (ChatCompletion) con el proveedor correcto.
-    Configura los globales de openai bajo lock y los restaura al terminar."""
-    with _api_config_lock:
-        old_key, old_base = openai.api_key, openai.api_base
-        try:
-            _configurar_cliente_clasificacion()
-            return fn(*args, **kwargs)
-        finally:
-            openai.api_key, openai.api_base = old_key, old_base
-
-def _clasificacion_llm_async(fn, *args, **kwargs):
-    """Versión async de _clasificacion_llm (para openai.ChatCompletion.acreate).
-    El lock se libera durante el await: el resto del event loop no queda bloqueado."""
-    async def _run():
-        with _api_config_lock:
-            old_key, old_base = openai.api_key, openai.api_base
-            try:
-                _configurar_cliente_clasificacion()
-                return await fn(*args, **kwargs)
-            finally:
-                openai.api_key, openai.api_base = old_key, old_base
-    return _run()
-
-def _embedding_openai(fn, *args, **kwargs):
-    """Ejecuta una llamada de embeddings SIEMPRE contra OpenAI (el proveedor de
-    clasificación no ofrece text-embedding-3-small). Bajo lock: configura y restaura."""
-    with _api_config_lock:
-        old_key, old_base = openai.api_key, openai.api_base
-        try:
-            key = os.environ.get("OPENAI_EMBEDDING_API_KEY") or os.environ.get("OPENAI_API_KEY") or _secrets_get("OPENAI_EMBEDDING_API_KEY") or _secrets_get("OPENAI_API_KEY")
-            if not key:
-                raise KeyError("OPENAI_API_KEY no encontrada (necesaria para embeddings).")
-            openai.api_key = key
-            openai.api_base = OPENAI_BASE_URL
-            return fn(*args, **kwargs)
-        finally:
-            openai.api_key, openai.api_base = old_key, old_base
-
-CONCURRENT_REQUESTS          = 12   # 50→12: evita rate-limit 429 de OpenAI en Cloud
+CONCURRENT_REQUESTS          = 50
 SIMILARITY_THRESHOLD_TONO    = 0.94
 SIMILARITY_THRESHOLD_TITULOS = 0.92
 MAX_PALABRAS_SUBTEMA         = 5
@@ -183,20 +89,6 @@ SIM_MINIMA_FUSION_INTER       = 0.90
 PRICE_INPUT_1M     = 0.10
 PRICE_OUTPUT_1M    = 0.40
 PRICE_EMBEDDING_1M = 0.02
-
-def _snapshot_tokens():
-    """Copia de los contadores globales de tokens (para calcular el costo POR ejecución)."""
-    ss = st.session_state
-    return (ss.get('tokens_input', 0), ss.get('tokens_output', 0), ss.get('tokens_embedding', 0))
-
-def _costo_desde_snapshot(base):
-    """Costo en USD del delta de tokens entre el baseline y el estado actual."""
-    ti, to, te = _snapshot_tokens()
-    bi, bo, be = base
-    ci = max(0, ti - bi) / 1e6 * PRICE_INPUT_1M
-    co = max(0, to - bo) / 1e6 * PRICE_OUTPUT_1M
-    ce = max(0, te - be) / 1e6 * PRICE_EMBEDDING_1M
-    return f"${ci + co + ce:.4f} USD", (ci + co + ce)
 
 if 'tokens_input' not in st.session_state: st.session_state['tokens_input']     = 0
 if 'tokens_output' not in st.session_state: st.session_state['tokens_output']    = 0
@@ -789,9 +681,7 @@ class EmbeddingCache:
             self._disk_path = None
 
     def _key(self, text):
-        # Clave sobre el texto COMPLETO: evita colisiones entre textos largos que
-        # comparten el mismo prefijo (el truncado a 2000 solo aplica a la llamada API).
-        return hashlib.md5(str(text).encode('utf-8', errors='ignore')).hexdigest()
+        return hashlib.md5(text[:2000].encode('utf-8', errors='ignore')).hexdigest()
 
     def get(self, text):
         k = self._key(text)
@@ -893,19 +783,6 @@ def refresh_config_cache():
 # Funciones Auxiliares de Limpieza, Enlaces y Conversión
 # ======================================
 
-def _resolver_password_secret():
-    """Resuelve la contraseña de acceso. Acepta varias claves de secrets y env:
-    APP_PASSWORD (nombre canónico) o password (usado en versiones anteriores del
-    README). Devuelve (valor, clave_usada)."""
-    for k in ("APP_PASSWORD", "password", "PASSWORD"):
-        v = os.environ.get(k)
-        if v:
-            return v, k
-        v = _secrets_get(k)
-        if v:
-            return v, k
-    return None, None
-
 def check_password():
     if st.session_state.get("password_correct", False):
         return True
@@ -920,14 +797,7 @@ def check_password():
         with st.form("pw"):
             pw = st.text_input("Contraseña", type="password", placeholder="Ingresa tu contraseña")
             if st.form_submit_button("Ingresar", use_container_width=True, type="primary"):
-                expected, clave = _resolver_password_secret()
-                if expected is None:
-                    st.error(
-                        "❌ La contraseña no está configurada en los Secrets. "
-                        "Agrega `APP_PASSWORD` (o `password`) en .streamlit/secrets.toml "
-                        "o en los Secrets de Streamlit Cloud y vuelve a cargar la app."
-                    )
-                elif pw == expected:
+                if pw == st.secrets.get("APP_PASSWORD", "INVALID"):
                     st.session_state["password_correct"] = True
                     st.rerun()
                 else:
@@ -935,32 +805,24 @@ def check_password():
     return False
 
 def call_with_retries(fn, *a, **kw):
-    d = 1.0
-    for att in range(4):
+    d = 1
+    for att in range(3):
         try:
             return fn(*a, **kw)
         except Exception as e:
-            # 429 (rate limit): dejar que el error se propague para que el flujo lo
-            # degrade con su propio manejo (fallback/Neutro) en vez de quemar reintentos.
-            status = getattr(e, "status", None) or getattr(e, "status_code", None)
-            if status == 429:
-                raise e
-            if att == 3: raise e
-            time.sleep(d + random.random() * 0.5)
-            d = min(d * 2, 8.0)
+            if att == 2: raise e
+            time.sleep(d)
+            d *= 2
 
 async def acall_with_retries(fn, *a, **kw):
-    d = 1.0
-    for att in range(4):
+    d = 1
+    for att in range(3):
         try:
             return await fn(*a, **kw)
         except Exception as e:
-            status = getattr(e, "status", None) or getattr(e, "status_code", None)
-            if status == 429:
-                raise e
-            if att == 3: raise e
-            await asyncio.sleep(d + random.random() * 0.5)
-            d = min(d * 2, 8.0)
+            if att == 2: raise e
+            await asyncio.sleep(d)
+            d *= 2
 
 def norm_key(text):
     if text is None: return ""
@@ -1070,30 +932,6 @@ def _etiquetas_compatibles(a: str, b: str, min_overlap: float = 0.45) -> bool:
     if _hay_conflicto_accion(na, nb): return False
     if SequenceMatcher(None, na, nb).ratio() >= 0.90: return True
     return _overlap_distintivo(na, nb) >= min_overlap
-
-def _pares_candidatos_por_tokens(textos, min_len=4, max_bloque=1000):
-    """Pares (i, j) que comparten al menos un token distintivo.
-
-    Sustituye el barrido O(n²) completo por bloques de candidatos sin perder ningún
-    par relevante: cualquier par con similitud >= umbral del pipeline comparte tokens
-    distintivos (los umbrales de overlap usados son >= 0.16..0.78, imposibles sin tokens
-    comunes). Idéntico conjunto de pares evaluados → resultados idénticos.
-    """
-    n = len(textos)
-    if n < 2:
-        return []
-    tokens = [_tokens_distintivos(str(t), min_len=min_len) for t in textos]
-    indice = defaultdict(set)
-    for i, tk in enumerate(tokens):
-        for tok in tk:
-            indice[tok].add(i)
-    pares = set()
-    for idxs in indice.values():
-        if len(idxs) > max_bloque:
-            continue  # bloque degenerado (token muy común): mismo criterio que construir_grupos_consistentes
-        orden = sorted(idxs)
-        pares.update((orden[a], orden[b]) for a in range(len(orden)) for b in range(a + 1, len(orden)))
-    return sorted(pares)
 
 def _grupos_contenido_compatibles(
     textos_a: list,
@@ -1549,7 +1387,7 @@ def _validar_etiqueta_completa(etiqueta, titulos_grp=None, resumenes_grp=None, m
                 "INCORRECTO: 'Terminal transportes', 'Operación canal'\n"
                 'JSON: {"subtema":"..."}'
             )
-            resp = call_with_retries(_clasificacion_llm,
+            resp = call_with_retries(
                 openai.ChatCompletion.create,
                 model=OPENAI_MODEL_CLASIFICACION,
                 messages=[{"role": "user", "content": prompt}],
@@ -1618,18 +1456,14 @@ def dedup_labels(etiquetas, umbral=UMBRAL_DEDUP_LABEL):
     le = get_embeddings_batch(unique)
     vp = [(i, le[i]) for i in range(n) if le[i] is not None]
     if len(vp) >= 2:
-        # B7: sin matriz n×n — solo pares que comparten tokens distintivos (mismos
-        # candidatos que el barrido completo; el umbral de overlap >= 0.45 exige tokens comunes).
         vi, vv = zip(*vp)
-        vv_arr = np.array(vv)
-        pares = _pares_candidatos_por_tokens([normed[i] for i in vi], min_len=4)
-        for pi, pj in pares:
-            i, j = vi[pi], vi[pj]
-            if find(i) == find(j):
-                continue
-            if cosine_similarity(vv_arr[pi].reshape(1, -1), vv_arr[pj].reshape(1, -1))[0][0] >= max(umbral, 0.90):
-                if _es_fusion_segura(normed[i], normed[j]):
-                    union(i, j)
+        sm = cosine_similarity(np.array(vv))
+        for pi in range(len(vi)):
+            for pj in range(pi + 1, len(vi)):
+                if sm[pi][pj] >= max(umbral, 0.90):
+                    if find(vi[pi]) != find(vi[pj]):
+                        if _es_fusion_segura(normed[vi[pi]], normed[vi[pj]]):
+                            union(vi[pi], vi[pj])
 
     freq = Counter(etiquetas)
     grupos = defaultdict(list)
@@ -1667,7 +1501,7 @@ def _fusionar_subtemas_semanticos(subtemas, textos_por_subtema, marca, aliases, 
     valid = [(i, emb_repr[i]) for i in range(len(unique_subs)) if emb_repr[i] is not None]
     if len(valid) < 2: return subtemas
     v_idx, v_emb = zip(*valid)
-    v_emb_arr = np.array(v_emb)
+    sim = cosine_similarity(np.array(v_emb))
     n = len(v_idx)
     parent = list(range(n))
 
@@ -1681,24 +1515,19 @@ def _fusionar_subtemas_semanticos(subtemas, textos_por_subtema, marca, aliases, 
         ra, rb = find(a), find(b)
         if ra != rb: parent[rb] = ra
 
-    # B7: sin matriz n×n — solo pares que comparten tokens distintivos del subtema
-    # (el overlap mínimo exigido por _grupos_contenido_compatibles hace imposible
-    # fusionar pares sin tokens comunes → mismo conjunto de pares que el barrido completo).
-    pares = _pares_candidatos_por_tokens([unique_subs[i] for i in v_idx], min_len=4)
-    for pi, pj in pares:
-        if find(pi) == find(pj):
-            continue
-        i, j = v_idx[pi], v_idx[pj]
-        sub_i, sub_j = unique_subs[i], unique_subs[j]
-        if cosine_similarity(v_emb_arr[pi].reshape(1, -1), v_emb_arr[pj].reshape(1, -1))[0][0] >= max(umbral, 0.88) and _grupos_contenido_compatibles(
-            textos_por_subtema.get(sub_i, []),
-            textos_por_subtema.get(sub_j, []),
-            sub_i,
-            sub_j,
-            min_sim=max(umbral, 0.88),
-            min_overlap=0.22,
-        ):
-            union(pi, pj)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if find(i) == find(j): continue
+            sub_i, sub_j = unique_subs[v_idx[i]], unique_subs[v_idx[j]]
+            if sim[i][j] >= max(umbral, 0.88) and _grupos_contenido_compatibles(
+                textos_por_subtema.get(sub_i, []),
+                textos_por_subtema.get(sub_j, []),
+                sub_i,
+                sub_j,
+                min_sim=max(umbral, 0.88),
+                min_overlap=0.22,
+            ):
+                union(i, j)
             
     grupos = defaultdict(list)
     for i in range(n): grupos[find(i)].append(v_idx[i])
@@ -1736,7 +1565,7 @@ def _unificar_subtemas_llm(subtemas_a_unificar, textos_por_subtema, marca, alias
         'JSON: {"subtema":"..."}'
     )
     try:
-        resp = call_with_retries(_clasificacion_llm,
+        resp = call_with_retries(
             openai.ChatCompletion.create,
             model=OPENAI_MODEL_CLASIFICACION,
             messages=[{"role": "user", "content": prompt}],
@@ -1759,14 +1588,12 @@ def get_embeddings_batch(textos, batch_size=100):
     cache = get_embedding_cache()
     resultados, missing = cache.get_many(textos)
     if not missing: return resultados
-    # La llamada a la API se hace con el texto truncado (igual que antes), pero la
-    # clave de caché usa el texto completo (fix A2: sin colisiones por prefijo).
     mt = [textos[i][:2000] if textos[i] else "" for i in missing]
     for i in range(0, len(mt), batch_size):
         batch = mt[i:i + batch_size]
         bidx = missing[i:i + batch_size]
         try:
-            resp = call_with_retries(_embedding_openai, openai.Embedding.create, input=batch, model=OPENAI_MODEL_EMBEDDING)
+            resp = call_with_retries(openai.Embedding.create, input=batch, model=OPENAI_MODEL_EMBEDDING)
             u = resp.get('usage', {}) if isinstance(resp, dict) else getattr(resp, 'usage', {})
             if u:
                 st.session_state['tokens_embedding'] += (u.get('total_tokens') if isinstance(u, dict) else getattr(u, 'total_tokens', 0)) or 0
@@ -1775,24 +1602,17 @@ def get_embeddings_batch(textos, batch_size=100):
                 emb = d["embedding"]
                 resultados[oi] = emb
                 cache.put(textos[oi], emb)
-        except Exception:
+        except:
             for j, t in enumerate(batch):
                 oi = bidx[j]
                 try:
-                    r = _embedding_openai(openai.Embedding.create, input=[t], model=OPENAI_MODEL_EMBEDDING)
+                    r = openai.Embedding.create(input=[t], model=OPENAI_MODEL_EMBEDDING)
                     emb = r["data"][0]["embedding"]
                     resultados[oi] = emb
                     cache.put(textos[oi], emb)
-                except Exception:
-                    resultados[oi] = None
+                except:
+                    pass
     cache.flush()
-    # A3: visibilidad de fallos sin cambiar la semántica (None sigue == sin agrupar).
-    n_fail = sum(1 for r in resultados if r is None)
-    if n_fail:
-        st.warning(
-            f"⚠️ {n_fail} texto(s) sin embedding (fallo de API). "
-            "Esas noticias se clasificarán sin agrupación semántica; revisa la clave de OpenAI o reintenta."
-        )
     return resultados
 
 class DSU:
@@ -2116,7 +1936,6 @@ class ClasificadorTono:
 
             try:
                 resp = await acall_with_retries(
-                    _clasificacion_llm_async,
                     openai.ChatCompletion.acreate,
                     model=OPENAI_MODEL_CLASIFICACION,
                     messages=[{"role": "user", "content": prompt}],
@@ -2154,16 +1973,11 @@ class ClasificadorTono:
         embs = get_embeddings_batch(txts_emb)
         candidatos = agrupar_textos_similares(txts_emb, SIMILARITY_THRESHOLD_TONO)
         candidatos.update({len(candidatos) + k: v for k, v in agrupar_por_titulo_similar(titulos.tolist()).items()})
-        # B7: descarta pares sin tokens distintivos compartidos — no pueden superar
-        # _overlap_distintivo >= 0.45 exigido por contenido_casi_igual (lossless).
-        tok_blocks = _pares_candidatos_por_tokens(txts_emb, min_len=4)
         for idxs in candidatos.values():
             for pos, i in enumerate(idxs):
                 for j in idxs[pos + 1:]:
                     ti, tj = normalize_title_for_comparison(titulos.iloc[i]), normalize_title_for_comparison(titulos.iloc[j])
                     titulo_casi_igual = SequenceMatcher(None, ti, tj).ratio() >= 0.96
-                    if not titulo_casi_igual and (i, j) not in tok_blocks and (j, i) not in tok_blocks:
-                        continue  # sin tokens comunes: overlap < 0.45 → no puede ser contenido_casi_igual
                     contenido_casi_igual = (
                         embs[i] is not None and embs[j] is not None
                         and cosine_similarity(np.array(embs[i]).reshape(1, -1), np.array(embs[j]).reshape(1, -1))[0][0] >= SIMILARITY_THRESHOLD_TONO
@@ -2189,7 +2003,7 @@ class ClasificadorTono:
             else:
                 reps[cid] = (idxs[0], "")
         
-        sem = asyncio.Semaphore(max(1, min(CONCURRENT_REQUESTS, len(reps) or 1)))
+        sem = asyncio.Semaphore(CONCURRENT_REQUESTS)
         cids = list(reps.keys())
         
         async def _clasificar_con_cid(cid):
@@ -2633,7 +2447,7 @@ class ClasificadorSubtema:
             return p0 in _VERBOS_LEAD_SUBTEMA or bool(_RE_VERBO_SUBTEMA.search(p0))
 
         try:
-            resp = call_with_retries(_clasificacion_llm,
+            resp = call_with_retries(
                 openai.ChatCompletion.create,
                 model=OPENAI_MODEL_CLASIFICACION,
                 messages=[{"role": "user", "content": prompt}],
@@ -2736,7 +2550,7 @@ class ClasificadorSubtema:
             'JSON: {"subtema":"..."}'
         )
         try:
-            resp = call_with_retries(_clasificacion_llm,
+            resp = call_with_retries(
                 openai.ChatCompletion.create,
                 model=OPENAI_MODEL_CLASIFICACION,
                 messages=[{"role": "user", "content": prompt}],
@@ -2829,7 +2643,7 @@ class ClasificadorSubtema:
             '{"Tendencias de consumo de pollo": "Tendencias de consumo de pollo", "Hábitos de compra de aves": "Tendencias de consumo de pollo"}'
         )
         try:
-            resp = call_with_retries(_clasificacion_llm,
+            resp = call_with_retries(
                 openai.ChatCompletion.create,
                 model=OPENAI_MODEL_CLASIFICACION,
                 messages=[{"role": "user", "content": prompt}],
@@ -3068,7 +2882,7 @@ def _generar_nombre_tema_llm(subtemas_grupo, textos_muestra, titulos_muestra, ma
         'JSON: {"tema":"..."}'
     )
     try:
-        resp = call_with_retries(_clasificacion_llm,
+        resp = call_with_retries(
             openai.ChatCompletion.create,
             model=OPENAI_MODEL_CLASIFICACION,
             messages=[{"role": "user", "content": prompt}],
@@ -3093,7 +2907,7 @@ def _regenerar_tema_diferente(subtemas_grupo, titulos_muestra, intento=0):
         'JSON: {"tema":"..."}'
     )
     try:
-        resp = call_with_retries(_clasificacion_llm,
+        resp = call_with_retries(
             openai.ChatCompletion.create,
             model=OPENAI_MODEL_CLASIFICACION,
             messages=[{"role": "user", "content": prompt}],
@@ -3140,26 +2954,14 @@ def consolidar_temas(subtemas, textos, pbar, marca=""):
         pbar.progress(1.0, "Sin agrupación")
         return [capitalizar_etiqueta(s) for s in subtemas]
     idx_map = {s: i for i, s in enumerate(us)}
-    # B7: matrices de similitud por bloques (idénticos valores, pico de memoria menor).
-    def _cos_matrix_bloques(vectors, tam_bloque=512):
-        m = len(vectors)
-        out = np.zeros((m, m), dtype=np.float64)
-        for a0 in range(0, m, tam_bloque):
-            a1 = min(a0 + tam_bloque, m)
-            bloque = cosine_similarity(vectors[a0:a1], vectors)
-            out[a0:a1, :] = bloque
-        return out
-
     M_content = np.array([centroids_contenido[s] for s in vs])
-    sim_content = _cos_matrix_bloques(M_content)
+    sim_content = cosine_similarity(M_content)
     has_repr = all(emb_repr[idx_map[s]] is not None for s in vs)
     has_label = all(emb_labels[idx_map[s]] is not None for s in vs)
     if has_repr and has_label:
-        sim_combined = (0.50 * sim_content
-                        + 0.35 * _cos_matrix_bloques(np.array([emb_repr[idx_map[s]] for s in vs]))
-                        + 0.15 * _cos_matrix_bloques(np.array([emb_labels[idx_map[s]] for s in vs])))
+        sim_combined = (0.50 * sim_content + 0.35 * cosine_similarity(np.array([emb_repr[idx_map[s]] for s in vs])) + 0.15 * cosine_similarity(np.array([emb_labels[idx_map[s]] for s in vs])))
     elif has_repr:
-        sim_combined = (0.60 * sim_content + 0.40 * _cos_matrix_bloques(np.array([emb_repr[idx_map[s]] for s in vs])))
+        sim_combined = (0.60 * sim_content + 0.40 * cosine_similarity(np.array([emb_repr[idx_map[s]] for s in vs])))
     else:
         sim_combined = sim_content
 
@@ -3321,20 +3123,18 @@ def _fusionar_temas_contenidos(temas: List[str]) -> Dict[str, str]:
         embs = get_embeddings_batch(textos_c)
         validos = [(textos_c[i], embs[i]) for i in range(len(textos_c)) if embs[i] is not None]
         if len(validos) >= 2:
-            # B7: sin matriz n×n — solo pares con tokens distintivos compartidos.
             etqs, vecs = zip(*validos)
-            vecs_arr = np.array(vecs)
-            pares = _pares_candidatos_por_tokens([normed[c] for c in etqs], min_len=4)
-            for pi, pj in pares:
-                ta, tb = etqs[pi], etqs[pj]
-                if ta in mapa or tb in mapa:
-                    continue
-                if cosine_similarity(vecs_arr[pi].reshape(1, -1), vecs_arr[pj].reshape(1, -1))[0][0] >= umbral_relajado:
-                    if _etiquetas_compatibles(ta, tb, min_overlap=0.60):
-                        freq = Counter(temas)
-                        canon = ta if freq.get(ta, 0) >= freq.get(tb, 0) else tb
-                        reemplazar = tb if canon == ta else ta
-                        mapa[reemplazar] = canon
+            sim = cosine_similarity(np.array(vecs))
+            for i in range(len(etqs)):
+                for j in range(i + 1, len(etqs)):
+                    if sim[i][j] >= umbral_relajado:
+                        ta, tb = etqs[i], etqs[j]
+                        if ta in mapa or tb in mapa: continue
+                        if _etiquetas_compatibles(ta, tb, min_overlap=0.60):
+                            freq = Counter(temas)
+                            canon = ta if freq.get(ta, 0) >= freq.get(tb, 0) else tb
+                            reemplazar = tb if canon == ta else ta
+                            mapa[reemplazar] = canon
     return mapa
 
 def _post_validar_tema_vs_subtema(temas, subtemas):
@@ -3696,16 +3496,15 @@ def generate_output_excel(rows, km):
 # ======================================
 async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=None, cliente="", voceros="", enable_scraping=False):
     st.session_state.update({'tokens_input': 0, 'tokens_output': 0, 'tokens_embedding': 0})
-    tok_base = _snapshot_tokens()  # baseline: costo de ESTA ejecución (B5)
     get_embedding_cache().reset_stats()  # mantiene los embeddings cacheados entre corridas (no los limpia)
     t0 = time.time()
     
     if "API" in mode:
         try:
-            _configurar_cliente_clasificacion()  # DeepSeek si está configurado; si no, OpenAI
+            openai.api_key=st.secrets["OPENAI_API_KEY"]
             openai.aiosession.set(None)
         except:
-            st.error("No se encontró la API key del proveedor de clasificación (DEEPSEEK_API_KEY u OPENAI_API_KEY).")
+            st.error("OPENAI_API_KEY no encontrado.")
             st.stop()
             
     with st.status("Paso 1 · Carga de Configuración y Dossier", expanded=True) as s:
@@ -3839,8 +3638,10 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
                 row.update(rm2.get(row.get("expanded_index"), {}))
                 
     gc.collect()
-    cost_str, cost_num = _costo_desde_snapshot(tok_base)
-
+    ci = (st.session_state['tokens_input']     / 1e6) * PRICE_INPUT_1M
+    co = (st.session_state['tokens_output']    / 1e6) * PRICE_OUTPUT_1M
+    ce = (st.session_state['tokens_embedding'] / 1e6) * PRICE_EMBEDDING_1M
+    
     st.session_state["brand_name"] = bn
     st.session_state["brand_aliases"] = ba
     with st.status("Paso 5 · Informe", expanded=True) as s:
@@ -3851,14 +3652,13 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
             "brand_name": bn, "brand_aliases": ba,
             "total_rows": len(rows), "unique_rows": len(ta), "duplicates": len(rows) - len(ta),
             "process_duration": f"{time.time() - t0:.0f}s",
-            "process_cost": cost_str,
+            "process_cost": f"${ci + co + ce:.4f} USD",
             "cache_stats": get_embedding_cache().stats()
         })
         s.update(label=f"✓ Completado · {get_embedding_cache().stats()}", state="complete")
 
 async def run_quick_async(df, tc, sc, bn, al):
     st.session_state.update({'tokens_input': 0, 'tokens_output': 0, 'tokens_embedding': 0})
-    tok_base = _snapshot_tokens()  # baseline: costo de ESTA ejecución (B5)
     get_embedding_cache().reset_stats()  # mantiene embeddings cacheados entre corridas
     df['_txt'] = df.apply(lambda r: _construir_texto_basico(r, tc, sc, bn, al), axis=1)
     with st.status("Embeddings...", expanded=True) as s:
@@ -3881,8 +3681,10 @@ async def run_quick_async(df, tc, sc, bn, al):
         df = aplicar_consistencia_grupos(df, tc, sc)
         s.update(label="✓ Clasificación", state="complete")
     df.drop(columns=['_txt'], inplace=True)
-    cost_str, cost_num = _costo_desde_snapshot(tok_base)
-    st.session_state['quick_cost'] = cost_str
+    ci = (st.session_state['tokens_input']     / 1e6) * PRICE_INPUT_1M
+    co = (st.session_state['tokens_output']    / 1e6) * PRICE_OUTPUT_1M
+    ce = (st.session_state['tokens_embedding'] / 1e6) * PRICE_EMBEDDING_1M
+    st.session_state['quick_cost'] = f"${ci + co + ce:.4f} USD"
     return df
 
 def gen_quick_excel(df, original_bytes=None):
@@ -3949,10 +3751,10 @@ def render_quick_tab():
                     st.error("Indica la marca.")
                 else:
                     try:
-                        _configurar_cliente_clasificacion()  # DeepSeek si está configurado; si no, OpenAI
+                        openai.api_key = st.secrets["OPENAI_API_KEY"]
                         openai.aiosession.set(None)
                     except:
-                        st.error("No se encontró la API key del proveedor de clasificación (DEEPSEEK_API_KEY u OPENAI_API_KEY).")
+                        st.error("OPENAI_API_KEY no encontrada.")
                         st.stop()
                     al = [a.strip() for a in bat.split(";") if a.strip()]
                     with st.spinner("Procesando..."):
@@ -3972,7 +3774,6 @@ def render_quick_tab():
 # ======================================
 async def run_custom_excel_async(file_bytes, tc, sc, bn, al, mode="API de OpenAI", tpkl=None, epkl=None):
     st.session_state.update({'tokens_input': 0, 'tokens_output': 0, 'tokens_embedding': 0})
-    tok_base = _snapshot_tokens()  # baseline: costo de ESTA ejecución (B5)
     get_embedding_cache().reset_stats()  # mantiene los embeddings cacheados entre corridas (no los limpia)
     t0 = time.time()
 
@@ -4082,7 +3883,11 @@ async def run_custom_excel_async(file_bytes, tc, sc, bn, al, mode="API de OpenAI
     buf_out = io.BytesIO()
     wb.save(buf_out)
 
-    cost_str, cost_num = _costo_desde_snapshot(tok_base)
+    ci = (st.session_state['tokens_input']     / 1e6) * PRICE_INPUT_1M
+    co = (st.session_state['tokens_output']    / 1e6) * PRICE_OUTPUT_1M
+    ce = (st.session_state['tokens_embedding'] / 1e6) * PRICE_EMBEDDING_1M
+
+    cost_str = f"${ci + co + ce:.4f} USD"
     time_str = f"{time.time() - t0:.0f}s"
 
     return buf_out.getvalue(), df, cost_str, time_str
@@ -4172,10 +3977,10 @@ def render_custom_excel_tab():
                 else:
                     if "API" in mode or "Híbrido" in mode:
                         try:
-                            _configurar_cliente_clasificacion()  # DeepSeek si está configurado; si no, OpenAI
+                            openai.api_key = st.secrets["OPENAI_API_KEY"]
                             openai.aiosession.set(None)
                         except:
-                            st.error("No se encontró la API key del proveedor de clasificación (DEEPSEEK_API_KEY u OPENAI_API_KEY).")
+                            st.error("OPENAI_API_KEY no encontrada en st.secrets.")
                             st.stop()
 
                     al = [a.strip() for a in bat.split(";") if a.strip()]
@@ -4241,7 +4046,7 @@ def render_sentiment_tab():
         if submit:
             if not brand.strip(): st.error('Ingresa la marca principal.')
             else:
-                if not pkl: _configurar_cliente_clasificacion()  # DeepSeek si está configurado; si no, OpenAI
+                if not pkl: openai.api_key = st.secrets['OPENAI_API_KEY']
                 aliases = [a.strip() for a in alias_text.split(';') if a.strip()]
                 with st.spinner('Analizando menciones de la marca...'):
                     result = asyncio.run(run_sentiment_only_async(df, tc, sc, brand.strip(), aliases, pkl))
