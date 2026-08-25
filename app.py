@@ -893,6 +893,19 @@ def refresh_config_cache():
 # Funciones Auxiliares de Limpieza, Enlaces y Conversión
 # ======================================
 
+def _resolver_password_secret():
+    """Resuelve la contraseña de acceso. Acepta varias claves de secrets y env:
+    APP_PASSWORD (nombre canónico) o password (usado en versiones anteriores del
+    README). Devuelve (valor, clave_usada)."""
+    for k in ("APP_PASSWORD", "password", "PASSWORD"):
+        v = os.environ.get(k)
+        if v:
+            return v, k
+        v = _secrets_get(k)
+        if v:
+            return v, k
+    return None, None
+
 def check_password():
     if st.session_state.get("password_correct", False):
         return True
@@ -907,7 +920,14 @@ def check_password():
         with st.form("pw"):
             pw = st.text_input("Contraseña", type="password", placeholder="Ingresa tu contraseña")
             if st.form_submit_button("Ingresar", use_container_width=True, type="primary"):
-                if pw == st.secrets.get("APP_PASSWORD", "INVALID"):
+                expected, clave = _resolver_password_secret()
+                if expected is None:
+                    st.error(
+                        "❌ La contraseña no está configurada en los Secrets. "
+                        "Agrega `APP_PASSWORD` (o `password`) en .streamlit/secrets.toml "
+                        "o en los Secrets de Streamlit Cloud y vuelve a cargar la app."
+                    )
+                elif pw == expected:
                     st.session_state["password_correct"] = True
                     st.rerun()
                 else:
