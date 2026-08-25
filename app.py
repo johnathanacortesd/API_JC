@@ -327,8 +327,10 @@ def _subtema_grounded(etiqueta, fuentes):
                for fs in fuente_stems):
             continue
         no_coinciden += 1
-    # Exigimos que como máximo UNA palabra de contenido quede sin apuntar al texto.
-    return no_coinciden <= 1
+    # Antes rechazaba con 1 sola palabra no anclada, lo que tiraba a fallback etiquetas
+    # legítimas (el tema no siempre aparece literal en un contexto corto). Ahora solo rechaza
+    # si MÁS DE LA MITAD de las palabras de contenido no tiene anclaje (label casi entera inventada).
+    return no_coinciden * 2 <= len(contenido)
 
 
 _PATRON_TITULAR = re.compile(
@@ -991,6 +993,21 @@ def _es_nombre_o_fragmento_marca(etiqueta: str, marca: str, aliases=None) -> boo
             return True
     return False
 
+def _es_verboso_con_marca(etiqueta, marca, aliases=None):
+    """Detecta etiquetas vacías tipo 'Investigación sobre universidad simón bolívar':
+    un verbo-muletilla (investigación/estudio/análisis/informe) + 'sobre/de' + SOLO la marca.
+    Eso no describe un hecho; se debe regenerar con un asunto real."""
+    s = (etiqueta or "").strip()
+    m = re.match(
+        r"^(investigaci[oó]n|estudio|an[aá]lisis|informe|trabajo)\s+"
+        r"(sobre|acerca de|de|del|sobre la|sobre el|de la|de el)\s+(.+)$",
+        s, re.IGNORECASE,
+    )
+    if not m:
+        return False
+    resto = m.group(3)
+    return bool(resto.strip()) and _es_nombre_o_fragmento_marca(resto, marca, aliases)
+
 def extract_link(cell):
     if hasattr(cell, "hyperlink") and cell.hyperlink:
         return {"value": "Link", "url": cell.hyperlink.target}
@@ -1236,7 +1253,11 @@ def _safe_filename_part(value):
 
 _TERMINAL_PUNCT = re.compile(r'[.!?…]')
 MIN_PALABRAS_CONTEXTO = 10
-MAX_CONTEXTO_CHARS = 1800
+# Contexto amplio: más caracteres alrededor de la mención de la marca/alias para un análisis
+# más preciso de tono y subtema (el usuario pidió ampliarlo). ~600 carácter. mínimos garantizados,
+# tope de ~2600.
+CONTEXTO_MIN_CHARS = 600
+MAX_CONTEXTO_CHARS = 2600
 
 def _texto_hasta_terminal(texto, n=1):
     """Recorta 'texto' para que termine justo tras el enésimo signo de cierre (punto)."""
@@ -1248,16 +1269,15 @@ def _texto_hasta_terminal(texto, n=1):
             return texto[:m.end()].strip(" \n\t")
     return texto.strip(" \n\t")
 
-def _contexto_para_excel(contexto, max_chars=900, umbral_corto=127):
-    """Paso final de limpieza del 'Contexto analizado' para el Excel: recorta el
-    párrafo completo hasta el PRIMER punto; si ese tramo queda < umbral_corto car.,
-    extiende hasta el SEGUNDO punto. Tope ~max_chars."""
+def _contexto_para_excel(contexto, max_chars=1400, umbral_corto=127):
+    """Paso final de limpieza del 'Contexto analizado' para el Excel: toma hasta 3 oraciones
+    (más contexto de la marca) con tope ~max_chars, ampliado tras el reciente aumento de caracteres."""
     if not contexto:
         return ""
     texto = str(contexto).strip()
-    tramo = _texto_hasta_terminal(texto, n=1)
+    tramo = _texto_hasta_terminal(texto, n=2)
     if 0 < len(tramo) < umbral_corto:
-        ampliada = _texto_hasta_terminal(texto, n=2)
+        ampliada = _texto_hasta_terminal(texto, n=3)
         if len(ampliada) > len(tramo):
             tramo = ampliada
     if len(tramo) > max_chars:
@@ -1266,19 +1286,18 @@ def _contexto_para_excel(contexto, max_chars=900, umbral_corto=127):
 
 def _construir_texto_basico(row, tc, sc, bn, al):
     """Texto base de análisis: prioridad Título → Contexto analizado → Resumen-Aclaración,
-    con el CONTEXTO AMPLIO (párrafo completo de la marca, hasta ~1500 car)."""
+    con el CONTEXTO AMPLIO (párrafo completo de la marca, hasta ~2200 car)."""
     titulo = str(row.get(tc, "") or "").strip()
     resumen = str(row.get(sc, "") or "").strip()[:300]
     ctx = extraer_contexto_marca(row.get(tc, ""), row.get(sc, ""), bn, al, row.get("Cuerpo Completo"))
     if ctx:
-        ctx = ctx[:1500]
+        ctx = ctx[:2200]
     return f"{titulo}. {titulo}. {ctx}. {resumen}".strip(" .")
 
 def _extraer_parrafo_marca(fuente, marca, aliases):
-    """Contexto estructurado: inicio del párrafo → punto final del párrafo completo.
-    Si el tramo queda muy corto (< MIN_PALABRAS_CONTEXTO), se extiende hasta el
-    segundo punto del texto siguiente (regla: 'a punto final, o al segundo punto
-    si el texto es muy corto')."""
+    """Contexto amplio de la marca: parte del párrafo que la menciona y añade los párrafos
+    siguientes hasta cubrir CONTEXTO_MIN_CHARS (≈600 car.), con tope MAX_CONTEXTO_CHARS.
+    Así el análisis del tono/subtema de la marca cuenta con MÁS caracteres (pedido del usuario)."""
     parrafos = [p.strip() for p in re.split(r'\n+', fuente) if p and p.strip()]
     if not parrafos:
         parrafos = [fuente.strip()]
@@ -1286,17 +1305,19 @@ def _extraer_parrafo_marca(fuente, marca, aliases):
     if not con_hits:
         return ""
     i = con_hits[0]  # primer párrafo que menciona la marca
-    # Tramo primario: párrafo completo, desde su inicio hasta su punto final.
-    tramo = parrafos[i]
-    palabras = len(tramo.split())
-    # Si el párrafo quedó muy corto, ampliar con el texto siguiente hasta el 2º punto.
-    if palabras < MIN_PALABRAS_CONTEXTO:
-        partes = [tramo]
-        for j in range(i + 1, len(parrafos)):
-            partes.append(_texto_hasta_terminal(parrafos[j], n=2))
-            tramo = " ".join(p for p in partes if p).strip()
-            if len(tramo.split()) >= MIN_PALABRAS_CONTEXTO:
-                break
+    partes = [parrafos[i]]
+    acum = len(parrafos[i])
+    # Ampliar con el texto siguiente (hasta su 2º punto) mientras no se cubra el mínimo.
+    for j in range(i + 1, len(parrafos)):
+        if acum >= CONTEXTO_MIN_CHARS:
+            break
+        siguientes = parrafos[j]
+        tramo1 = _texto_hasta_terminal(siguientes, n=1)
+        if 0 < len(tramo1) < 60:
+            siguientes = _texto_hasta_terminal(siguientes, n=2)
+        partes.append(siguientes)
+        acum += len(siguientes)
+    tramo = " ".join(p for p in partes if p).strip()
     return tramo[:MAX_CONTEXTO_CHARS]
 
 def _brand_audit(titulo, resumen, marca, aliases, cuerpo=None):
@@ -1877,7 +1898,7 @@ class ClasificadorTono:
             if os.environ.get("GRILL_TONO_DETERMINISTA", "1") != "0":
                 det = _tono_determinista(eval_txt, self.marca, self.aliases)
                 if det:
-                    det["evidencia"] = eval_txt[:1800]
+                    det["evidencia"] = eval_txt[:2400]
                     return det
 
             aliases_str = f" (también conocida como: {', '.join(self.aliases)})" if self.aliases else ""
@@ -1891,7 +1912,7 @@ class ClasificadorTono:
                 f"Estar en una LISTA DE GANADORES no es Neutro. "
                 f"Si el artículo es positivo o trágico a nivel país/sector, pero '{self.marca}' queda "
                 f"criticada, demandada o cuestionada, el tono es Negativo.\n\n"
-                f"TEXTO CENTRADO EN LA MARCA:\n{eval_txt[:1600]}\n\n"
+                f"TEXTO CENTRADO EN LA MARCA:\n{eval_txt[:2400]}\n\n"
                 f"REGLAS DE CLASIFICACIÓN ESTRICTAS:\n"
                 f"🔴 NEGATIVO: un hecho perjudica, cuestiona o expone directamente a '{self.marca}' "
                 f"(demandas, multas, fraudes, fallas propias, quejas, investigaciones, pérdidas o retiro de productos).\n"
@@ -1937,9 +1958,9 @@ class ClasificadorTono:
                     confianza = "Media"
                 return {"tono": tono, "confianza": confianza,
                         "justificacion": str(resultado.get("justificacion", "")).strip()[:400],
-                        "evidencia": eval_txt[:1800]}
+                        "evidencia": eval_txt[:2400]}
             except Exception as e:
-                return {"tono": "Neutro", "confianza": "Baja", "justificacion": "Error de clasificación", "evidencia": eval_txt[:1800]}
+                return {"tono": "Neutro", "confianza": "Baja", "justificacion": "Error de clasificación", "evidencia": eval_txt[:2400]}
 
     async def procesar_lote_async(self, textos, pbar, resumenes, titulos, cuerpos=None):
         n = len(textos)
@@ -2090,7 +2111,7 @@ def analizar_tono_con_pkl(textos, pkl_file, titulos=None, resumenes=None, marca=
             for i in range(n):
                 ctx = extraer_contexto_marca(titulos[i], resumenes[i], marca, aliases, cuerpos[i] if cuerpos is not None else None)
                 if ctx:
-                    snippets.append(_snippet_tono_pkl(titulos[i], ctx)[:1800])
+                    snippets.append(_snippet_tono_pkl(titulos[i], ctx)[:2400])
                     flags.append(True)
                 else:
                     snippets.append("")
@@ -2358,6 +2379,12 @@ class ClasificadorSubtema:
 
         bloq_resumenes = ("\nRESÚMENES:\n" + "\n".join(f"  · {r}" for r in rm)) if rm else ""
 
+        # Contexto amplio de la MARCA (extraído del texto rico `_txt`): llega al prompt del
+        # subtema con más caracteres para que el asunto se derive de la mención de la marca.
+        ctx_txt = [str(t) for t in textos_grp[:2] if t and str(t).strip()]
+        bloq_contexto = ("\n\nCONTEXTO AMPLIADO (puede incluir la mención de la marca/alias):\n"
+                         + "\n".join(f"  · {c[:700]}" for c in ctx_txt)) if ctx_txt else ""
+
         prompt = (
             f"Eres analista de reputación que monitorea noticias sobre '{self.marca}'.\n"
             "Lee las noticias de este grupo y resume EL HECHO periodístico central en UNA sola "
@@ -2381,6 +2408,7 @@ class ClasificadorSubtema:
             "  - Etiquetas genéricas ('Gestión corporativa', 'Actividad institucional').\n\n"
             f"TÍTULOS:\n" + "\n".join(f"  · {t}" for t in tm)
             + bloq_resumenes
+            + bloq_contexto
             + lista_existentes
             + "\n\nEJEMPLOS CORRECTOS: 'Convenio de cooperación científica', 'Reconocimiento al liderazgo regional', "
             "'Intercambio intercultural en La Guajira', 'Explotación sexual de menores', 'Posesión del superintendente de Notariado'\n"
@@ -2457,9 +2485,10 @@ class ClasificadorSubtema:
                          "reputacion corporativa", "impacto corporativo"}
             es_gen = string_norm_label(et) in {string_norm_label(g) for g in genericas}
             es_solo_marca = _es_nombre_o_fragmento_marca(et, self.marca, self.aliases)
+            es_verboso_marca = _es_verboso_con_marca(et, self.marca, self.aliases)
             es_rob = _es_robotico(et)
 
-            if es_gen or es_solo_marca or es_rob or len(et.split()) < 3:
+            if es_gen or es_solo_marca or es_verboso_marca or es_rob or len(et.split()) < 3:
                 et = self._refinar(tm, None, rm, forzar_preposicion=True, prohibir_verbos=True)
 
             if not _validar_estructura_subtema(et):
