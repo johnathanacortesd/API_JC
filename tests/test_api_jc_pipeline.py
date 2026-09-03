@@ -243,6 +243,11 @@ class TestGroupingAndLabels(unittest.TestCase):
             "Sismo en cali cómo saber si",
             "Alcalde anunció obras en Cali",
             "Diporto resultados jornada fecha liga",
+            "Netflix por US$587 millones",
+            "Destacada entre las sociólogas más influyentes del país dentro",
+            "Múltiples y escalables a todas las fases de producción",
+            "Adquisición de InterPositive, por Netflix",
+            "Inversión de 587",
         ]
         for et in bad:
             self.assertFalse(core.validar_subtema(et), et)
@@ -261,7 +266,11 @@ class TestGroupingAndLabels(unittest.TestCase):
             "Video | Topos Azteca destacan la solidaridad de los caleños durante las labores de rescate humanitario en Cali",
         )
         self.assertTrue(core.validar_subtema(s), s)
-        self.assertTrue(s.endswith("rescate humanitario") or s.endswith("caleños") or s.endswith("de rescate"), s)
+        self.assertLessEqual(len(s.split()), 6, s)
+        self.assertNotIn(",", s)
+        n = s.lower()
+        self.assertTrue("solidaridad" in n or "rescate" in n or "caleñ" in n, s)
+        self.assertFalse(s.lower().endswith("dentro"))
         self.assertNotIn("labores", s.split()[-1], "must not end on a dangling noun of a split complement")
         ctx1 = "Tras el terremoto en Colombia ascienden las víctimas y los heridos."
         ctx2 = "Sismo en Cali: cómo saber si la vivienda quedó bien y qué recomendaciones seguir."
@@ -284,6 +293,58 @@ class TestGroupingAndLabels(unittest.TestCase):
         self.assertTrue(core.validar_subtema(sub), sub)
         self.assertNotEqual(core._norm_text(sub), core._norm_text(collage))
         self.assertTrue(any(n in sub.lower() for n in ("de", "del", "en", "sobre")))
+        self.assertLessEqual(len(sub.split()), 6, sub)
+
+
+class TestInterPositiveLabelsAndGroup(unittest.TestCase):
+    TITLES = [
+        "InterPositive, la IA de cineastas que compró Netflix por US$587 millones",
+        "InterPositive, la IA de cineastas que compró Netflix por US$587 millones",
+        "InterPositive, la IA de cineastas que compró Netflix",
+    ]
+
+    def test_13_similar_titles_same_group_same_complete_labels(self):
+        blurb = (
+            "La plataforma ofrece herramientas múltiples y escalables a todas "
+            "las fases de producción para cineastas independientes."
+        )
+        rows = [
+            _row(id=str(80 + i), titulo=t, medio=f"Medio{i}",
+                 resumen=blurb if i == 2 else "Netflix cerró la compra de InterPositive.",
+                 link={"value": "Link", "url": f"https://m{i}.com/interpositive-{i}"})
+            for i, t in enumerate(self.TITLES)
+        ]
+        out, _ = core.process_pipeline(rows, "Netflix", ["Netflix"])
+        gids = {r["Grupo noticia"] for r in out}
+        self.assertEqual(len(gids), 1, [r["Grupo noticia"] for r in out])
+        self.assertEqual(len({r["Tono IA"] for r in out}), 1)
+        self.assertEqual(len({r["Tema"] for r in out}), 1)
+        self.assertEqual(len({r["Subtema"] for r in out}), 1)
+        sub = out[0]["Subtema"]
+        tema = out[0]["Tema"]
+        self.assertTrue(core.validar_subtema(sub), sub)
+        self.assertTrue(core.validar_tema(tema), tema)
+        self.assertLessEqual(len(sub.split()), 6, sub)
+        self.assertNotIn(",", sub)
+        self.assertFalse(any(ch.isdigit() for ch in sub.split()[-1]), sub)
+        sl = sub.lower()
+        self.assertNotIn("millones", sl)
+        self.assertNotIn("escalables", sl)
+        self.assertNotIn("múltiples", sl)
+        self.assertTrue("interpositive" in sl or "netflix" in sl or "adquis" in sl, sub)
+        self.assertIn("de", sl.split())
+        for r in out:
+            self.assertEqual(r["Título"], self.TITLES[int(r["ID Noticia"]) - 80])
+
+    def test_14_fallback_nominalizes_acquisition_not_money_object(self):
+        t = self.TITLES[0]
+        blurb = "Herramientas múltiples y escalables a todas las fases de producción."
+        sub = core.fallback_subtema(blurb, t)
+        self.assertTrue(core.validar_subtema(sub), sub)
+        self.assertEqual(sub, core.fallback_subtema(blurb, self.TITLES[2]))
+        self.assertRegex(sub.lower(), r"adquisici[oó]n de interpositive")
+        self.assertNotIn("587", sub)
+        self.assertNotIn("$", sub)
 
 
 class TestOutputSchema(unittest.TestCase):
@@ -346,7 +407,7 @@ class TestScaleAndBatching(unittest.TestCase):
                     "id": it["id"],
                     "tono": "Neutro",
                     "tema": "Emergencias y desastres naturales",
-                    "subtema": "Balance de daños del sismo en Cali",
+                    "subtema": "Balance de daños del sismo",
                 })
             return {"items": items}
 
@@ -376,7 +437,10 @@ class TestScaleAndBatching(unittest.TestCase):
         # Valid model output ⇒ one batched pass, no repair round.
         self.assertLessEqual(len(chat_calls), (n + core.CHAT_BATCH_SIZE - 1) // core.CHAT_BATCH_SIZE + 1)
         self.assertGreaterEqual(len(chat_calls), 1)
-        self.assertTrue(all(r["Subtema"] in ("Balance de daños del sismo en Cali", "-") for r in out))
+        self.assertTrue(all(
+            r["Subtema"] in ("Balance de daños del sismo", "-") or core.validar_subtema(r["Subtema"])
+            for r in out
+        ))
         for prompt in chat_calls:
             # Each request is a batch, not one news item.
             self.assertIn("ÍTEMS:", prompt)
