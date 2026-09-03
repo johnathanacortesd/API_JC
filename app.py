@@ -30,6 +30,20 @@ import xml.etree.ElementTree as ET
 import html
 from pathlib import Path
 
+import api_jc_core as _jc
+from api_jc_core import (
+    OUTPUT_COLUMNS,
+    aplicar_buscarv,
+    aplicar_buscarv_dossier,
+    construir_mapa_buscarv,
+    extraer_hipervinculo_celda,
+    extraer_contexto_analizado,
+    generate_output_excel as generate_output_excel_core,
+    process_pipeline,
+    titulo_original,
+    valor_con_hipervinculo,
+)
+
 # ======================================
 # Configuración general
 # ======================================
@@ -40,13 +54,14 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-OPENAI_MODEL_EMBEDDING     = "text-embedding-3-small"
-OPENAI_MODEL_CLASIFICACION = "gpt-4.1-nano-2025-04-14"
+OPENAI_MODEL_EMBEDDING     = _jc.OPENAI_MODEL_EMBEDDING
+OPENAI_MODEL_CLASIFICACION = _jc.OPENAI_MODEL_CLASIFICACION
 
-CONCURRENT_REQUESTS          = 50
+CONCURRENT_REQUESTS          = 8
 SIMILARITY_THRESHOLD_TONO    = 0.94
 SIMILARITY_THRESHOLD_TITULOS = 0.92
-MAX_PALABRAS_SUBTEMA         = 5
+MAX_PALABRAS_SUBTEMA         = 7
+REQUEST_TIMEOUT_S            = _jc.REQUEST_TIMEOUT_S
 
 # ── Umbrales base (corpus grande ≥ 20 noticias) ──────────────────────────────
 UMBRAL_SUBTEMA = 0.78
@@ -489,14 +504,9 @@ CONFIG_CACHE_TTL = 300  # segundos
 
 @st.cache_data(ttl=CONFIG_CACHE_TTL, show_spinner=False)
 def _fetch_map_from_csv(csv_url: str) -> dict:
+    """Carga la tabla BUSCARV (columna 0 = clave, columna 1 = valor)."""
     df = pd.read_csv(csv_url, header=None, dtype=str)
-    df = df.dropna(how="all")
-    mapping = pd.Series(
-        df.iloc[:, 1].values,
-        index=df.iloc[:, 0].astype(str).str.lower().str.strip()
-    ).to_dict()
-    mapping = {k: v for k, v in mapping.items() if k not in ("nan", "")}
-    return mapping
+    return construir_mapa_buscarv(df)
 
 def load_config_from_sheets():
     regiones_url = st.secrets.get("REGIONES_CSV_URL")
@@ -549,22 +559,44 @@ def check_password():
 
 def call_with_retries(fn, *a, **kw):
     d = 1
+    kw = dict(kw)
+    if "request_timeout" not in kw:
+        kw["request_timeout"] = REQUEST_TIMEOUT_S
     for att in range(3):
         try:
             return fn(*a, **kw)
+        except TypeError:
+            kw.pop("request_timeout", None)
+            try:
+                return fn(*a, **kw)
+            except Exception as e:
+                if att == 2: raise e
+                time.sleep(min(d, 4))
+                d *= 2
         except Exception as e:
             if att == 2: raise e
-            time.sleep(d)
+            time.sleep(min(d, 4))
             d *= 2
 
 async def acall_with_retries(fn, *a, **kw):
     d = 1
+    kw = dict(kw)
+    if "request_timeout" not in kw:
+        kw["request_timeout"] = REQUEST_TIMEOUT_S
     for att in range(3):
         try:
             return await fn(*a, **kw)
+        except TypeError:
+            kw.pop("request_timeout", None)
+            try:
+                return await fn(*a, **kw)
+            except Exception as e:
+                if att == 2: raise e
+                await asyncio.sleep(min(d, 4))
+                d *= 2
         except Exception as e:
             if att == 2: raise e
-            await asyncio.sleep(d)
+            await asyncio.sleep(min(d, 4))
             d *= 2
 
 def norm_key(text):
@@ -737,17 +769,16 @@ def _es_nombre_o_fragmento_marca(etiqueta: str, marca: str, aliases=None) -> boo
     return False
 
 def extract_link(cell):
-    if hasattr(cell, "hyperlink") and cell.hyperlink:
-        return {"value": "Link", "url": cell.hyperlink.target}
-    if isinstance(cell.value, str) and "=HYPERLINK" in cell.value:
+    linked = valor_con_hipervinculo(cell)
+    if isinstance(linked, dict):
+        return {"value": linked.get("value") or "Link", "url": linked.get("url")}
+    if isinstance(getattr(cell, "value", None), str) and "=HYPERLINK" in cell.value:
         m = re.search(r'=HYPERLINK\("([^"]+)"', cell.value)
         if m: return {"value": "Link", "url": m.group(1)}
-    return {"value": cell.value, "url": None}
+    return {"value": getattr(cell, "value", cell), "url": None}
 
 def extract_link_from_cell(cell):
-    if cell.hyperlink and cell.hyperlink.target:
-        return cell.hyperlink.target
-    return None
+    return extraer_hipervinculo_celda(cell)
 
 def convert_html_entities(text):
     if not isinstance(text, str):
@@ -815,7 +846,8 @@ def normalize_title_for_comparison(title):
 
 
 def clean_title_for_output(title):
-    return re.sub(r"\s*\|\s*[\w\s]+$", "", str(title)).strip()
+    """Never alter the original Título cell. Normalized copies are internal only."""
+    return titulo_original(title)
 
 def corregir_texto(text):
     if not isinstance(text, str): return text
@@ -984,56 +1016,17 @@ def _brand_audit(titulo, resumen, marca, aliases):
     return d['contexto'], d['coincidencia'], d['origen']
 
 def extraer_contexto_marca(titulo, resumen, marca, aliases=None, ventana=320):
-    """Título + resumen si la marca/alias aparece. No recortar tanto como para perder 'ganadores'."""
-    titulo = str(titulo or "").strip()
-    resumen = str(resumen or "").strip()
-    texto = f"{titulo}. {resumen}".strip(" .")
-    if not texto or not marca or not _menciona_marca_o_alias(texto, marca, aliases):
-        return ""
-    partes = re.split(r'(?<=[\.\!\?\n])\s+', texto)
-    if len(partes) <= 1:
-        partes = re.split(r'\n+', texto)
-    hits = [p.strip() for p in partes if p.strip() and _menciona_marca_o_alias(p, marca, aliases)]
-    # Siempre incluir el título: ahí suele estar "ganadores" / el hecho.
-    bloques = []
-    if titulo:
-        bloques.append(titulo)
-    bloques.extend(hits)
-    # Never append the complete summary: sentiment must stay centered on the brand.
-    if hits and len(" ".join(hits).split()) < 12:
-        all_parts = [p.strip() for p in partes if p.strip()]
-        for hit in hits:
-            try:
-                pos = all_parts.index(hit)
-                if pos and all_parts[pos - 1] not in bloques:
-                    bloques.insert(0, all_parts[pos - 1])
-                elif pos + 1 < len(all_parts) and all_parts[pos + 1] not in bloques:
-                    bloques.append(all_parts[pos + 1])
-            except ValueError:
-                pass
-    vistos, out = set(), []
-    for h in bloques:
-        k = _normalizar_mencion(h)
-        if k and k not in vistos:
-            vistos.add(k)
-            out.append(h)
-    return " ".join(out)[:1800] if out else texto[:1800]
+    """Ventanas de mención; fallback Resumen y luego Título. No muta el título original."""
+    return extraer_contexto_analizado(titulo, resumen, marca, aliases).get("contexto", "")
 
 def extraer_contexto_marca_detallado(titulo, resumen, marca, aliases=None):
     """Return auditable brand match metadata for sentiment analysis."""
-    titulo, resumen = str(titulo or "").strip(), str(resumen or "").strip()
-    nombres = _variantes_marca(marca, aliases)
-    title_hit = _menciona_marca_o_alias(titulo, marca, aliases)
-    summary_hit = _menciona_marca_o_alias(resumen, marca, aliases)
-    if not title_hit and not summary_hit:
-        return {"contexto": "", "marca_encontrada": "No", "origen": "", "coincidencia": ""}
-    origen = ", ".join(x for x, ok in (("Título", title_hit), ("Resumen", summary_hit)) if ok)
-    source = f"{titulo}. {resumen}".strip(" .")
-    source_norm = _normalizar_mencion(source)
-    matched = next((n for n in nombres if _coincide_nombre_completo(source_norm, n)), marca)
+    meta = extraer_contexto_analizado(titulo, resumen, marca, aliases)
     return {
-        "contexto": extraer_contexto_marca(titulo, resumen, marca, aliases),
-        "marca_encontrada": "Sí", "origen": origen, "coincidencia": matched,
+        "contexto": meta["contexto"],
+        "marca_encontrada": "Sí" if meta["coincidencia"] else "No",
+        "origen": meta["origen"],
+        "coincidencia": meta["coincidencia"],
     }
 
 def _validar_etiqueta_completa(etiqueta, titulos_grp=None, resumenes_grp=None, marca="", aliases=None, fallback_fn=None):
@@ -1350,44 +1343,15 @@ def seleccionar_representante(indices, textos):
     return idxs[best], textos[idxs[best]]
 
 def construir_grupos_consistentes(titulos, resumenes):
-    """Agrupa republicaciones y notas equivalentes con criterios conservadores."""
-    titulos = [str(x or "") for x in titulos]
-    resumenes = [str(x or "") for x in resumenes]
-    textos = [texto_para_embedding(t, r) for t, r in zip(titulos, resumenes)]
-    n = len(textos)
-    dsu = DSU(n)
-    embs = get_embeddings_batch(textos)
-    norm = [normalize_title_for_comparison(t) for t in titulos]
-
-    # Bloqueo por palabras distintivas para evitar una comparación O(n²) completa.
-    indice = defaultdict(set)
-    for i, titulo in enumerate(norm):
-        for token in _tokens_distintivos(titulo):
-            indice[token].add(i)
-    pares = set()
-    for idxs in indice.values():
-        if len(idxs) > 100:
-            continue
-        orden = sorted(idxs)
-        pares.update((orden[a], orden[b]) for a in range(len(orden)) for b in range(a + 1, len(orden)))
-
-    for i, j in pares:
-        if _hay_conflicto_accion(textos[i], textos[j]):
-            continue
-        title_sim = SequenceMatcher(None, norm[i], norm[j]).ratio() if norm[i] and norm[j] else 0.0
-        overlap = _overlap_distintivo(textos[i], textos[j])
-        semantic = 0.0
-        if embs[i] is not None and embs[j] is not None:
-            semantic = cosine_similarity(
-                np.array(embs[i]).reshape(1, -1), np.array(embs[j]).reshape(1, -1)
-            )[0][0]
-        if title_sim >= SIMILARITY_THRESHOLD_TITULOS or (semantic >= SIMILARITY_THRESHOLD_TONO and overlap >= 0.45):
-            dsu.union(i, j)
-    return dsu.grupos(n)
+    """Agrupa republicaciones y notas equivalentes con bloqueo (no n²)."""
+    return _jc.agrupar_noticias_bloqueado(
+        [str(x or "") for x in titulos],
+        [str(x or "") for x in resumenes],
+    )
 
 def aplicar_consistencia_grupos(df, titulo_col, resumen_col,
                                 tono_col="Tono IA", tema_col="Tema", subtema_col="Subtema"):
-    """Asigna Grupo noticia como overlay. No sobrescribe Tono IA / Tema / Subtema."""
+    """Asigna Grupo noticia y propaga Tono IA / Tema / Subtema del representante."""
     if df.empty:
         return df
     grupos = construir_grupos_consistentes(df[titulo_col].fillna(''), df[resumen_col].fillna(''))
@@ -1395,15 +1359,24 @@ def aplicar_consistencia_grupos(df, titulo_col, resumen_col,
     df["Grupo noticia"] = ""
     for numero, idxs in enumerate(grupos.values(), start=1):
         gid = f"G{numero:05d}"
-        for i in idxs:
-            df.at[df.index[i], "Grupo noticia"] = gid
-        # Keep existing labels even when members disagree. Majority vote was
-        # stamping a generic Subtema onto notes that must stay specific.
-    if subtema_col in df.columns:
-        df[subtema_col] = df[subtema_col].apply(
-            lambda x: capitalizar_etiqueta(_recortar_frase_completa(str(x), MAX_PALABRAS_SUBTEMA))
-            if str(x).strip().lower() not in {"", "nan", "n/a", "-"} else x
-        )
+        members = [df.index[i] for i in idxs]
+        for ix in members:
+            df.at[ix, "Grupo noticia"] = gid
+        candidatos = [ix for ix in members if str(df.at[ix, tono_col] if tono_col in df.columns else "") != "Duplicada"]
+        if not candidatos or tono_col not in df.columns:
+            continue
+        def _score(ix):
+            sub = str(df.at[ix, subtema_col] if subtema_col in df.columns else "")
+            tema = str(df.at[ix, tema_col] if tema_col in df.columns else "")
+            return (len(sub), len(tema))
+        best = max(candidatos, key=_score)
+        for ix in candidatos:
+            if tono_col in df.columns:
+                df.at[ix, tono_col] = df.at[best, tono_col]
+            if tema_col in df.columns:
+                df.at[ix, tema_col] = df.at[best, tema_col]
+            if subtema_col in df.columns:
+                df.at[ix, subtema_col] = df.at[best, subtema_col]
     return df
 
 
@@ -2648,81 +2621,11 @@ def _unificar_tema_por_subtema(temas, subtemas):
 # Duplicados y Excel (Reglas Nuevas)
 # ======================================
 def _normalizar_url(url: str) -> str:
-    if not url: return ""
-    url = url.strip().lower()
-    url = re.sub(r'^https?://', '', url)
-    url = re.sub(r'^www\.', '', url)
-    url = url.rstrip('/')
-    return url
+    return _jc.normalize_url(url)
 
 def detectar_duplicados_avanzado(rows, km):
-    processed = deepcopy(rows)
-    seen_url, seen_bcast = {}, {}
-    seen_streaming: Dict[tuple, int] = {}
-    tb = defaultdict(list)
-
-    for i, row in enumerate(processed):
-        if row.get("is_duplicate"): continue
-
-        tipo    = normalizar_tipo_medio(str(row.get(km["tipodemedio"], "")))
-        mencion = norm_key(row.get(km["menciones"], ""))
-        medio   = norm_key(row.get(km["medio"], ""))
-
-        streaming_url_raw = row.get(km["link_streaming"])
-        if isinstance(streaming_url_raw, dict):
-            streaming_url_raw = streaming_url_raw.get("url")
-            
-        if streaming_url_raw and mencion:
-            streaming_url_norm = _normalizar_url(str(streaming_url_raw))
-            if streaming_url_norm:
-                sk = (streaming_url_norm, mencion)
-                if sk in seen_streaming:
-                    row["is_duplicate"] = True
-                    row[km["idduplicada"]] = processed[seen_streaming[sk]].get(km["idnoticia"], "")
-                    continue
-                seen_streaming[sk] = i
-
-        if tipo == "Internet":
-            li = row.get(km["link_nota"])
-            url = li.get("url") if isinstance(li, dict) else li
-            if url and mencion:
-                url_norm = _normalizar_url(str(url))
-                k = (url_norm, mencion)
-                if k in seen_url:
-                    row["is_duplicate"] = True
-                    row[km["idduplicada"]] = processed[seen_url[k]].get(km["idnoticia"], "")
-                    continue
-                seen_url[k] = i
-            if medio and mencion:
-                tb[(medio, mencion)].append(i)
-
-        elif tipo in ("Radio", "Televisión"):
-            hora = str(row.get(km["hora"], "")).strip()
-            if mencion and medio and hora:
-                k = (mencion, medio, hora)
-                if k in seen_bcast:
-                    row["is_duplicate"] = True
-                    row[km["idduplicada"]] = processed[seen_bcast[k]].get(km["idnoticia"], "")
-                else:
-                    seen_bcast[k] = i
-
-    for idxs in tb.values():
-        if len(idxs) < 2: continue
-        for i in range(len(idxs)):
-            for j in range(i + 1, len(idxs)):
-                a, b = idxs[i], idxs[j]
-                if processed[a].get("is_duplicate") or processed[b].get("is_duplicate"): continue
-                ta  = normalize_title_for_comparison(processed[a].get(km["titulo"]))
-                tb_ = normalize_title_for_comparison(processed[b].get(km["titulo"]))
-                if ta and tb_ and SequenceMatcher(None, ta, tb_).ratio() >= SIMILARITY_THRESHOLD_TITULOS:
-                    if len(ta) < len(tb_):
-                        processed[a]["is_duplicate"] = True
-                        processed[a][km["idduplicada"]]  = processed[b].get(km["idnoticia"], "")
-                    else:
-                        processed[b]["is_duplicate"] = True
-                        processed[b][km["idduplicada"]]  = processed[a].get(km["idnoticia"], "")
-
-    return processed
+    """Delegate to the repaired rules. Same function name so the branch stays."""
+    return _jc.detectar_duplicados(rows, km)
 
 def read_and_normalize_dossier(sheet, region_map, internet_map):
     headers = [cell.value for cell in sheet[1] if cell.value is not None]
@@ -2735,8 +2638,12 @@ def read_and_normalize_dossier(sheet, region_map, internet_map):
             if i < len(row):
                 cell = row[i]
                 val = cell.value
-                url = cell.hyperlink.target if (cell.hyperlink and cell.hyperlink.target) else None
-                if url:
+                url = extraer_hipervinculo_celda(cell)
+                if h in ("Título", "Titulo"):
+                    raw_title = val.get("value") if isinstance(val, dict) else val
+                    row_data["_titulo_original"] = raw_title
+                    row_data[h] = raw_title
+                elif url:
                     row_data[h] = {"value": val or "Link", "url": url}
                 else:
                     row_data[h] = val
@@ -2766,19 +2673,16 @@ def read_and_normalize_dossier(sheet, region_map, internet_map):
     is_internet = df['Tipo de Medio'] == 'Internet'
 
     if 'Medio' in df.columns:
-        raw_medios_clean = df['Medio'].astype(str).str.lower().str.strip()
-        df['Región'] = raw_medios_clean.map(region_map).fillna("N/A")
+        # BUSCARV: Región = VLOOKUP(Medio, hoja Regiones); Medio Internet = VLOOKUP(Internet)
+        tipos_seq = df['Tipo de Medio'].tolist() if 'Tipo de Medio' in df.columns else None
+        regiones, medios_mapeados = aplicar_buscarv_dossier(
+            df['Medio'].tolist(), region_map, internet_map, tipos=tipos_seq
+        )
+        df['Región'] = regiones
+        df['Medio'] = medios_mapeados
     else:
         df['Medio'] = 'N/A'
         df['Región'] = 'N/A'
-
-    if 'Medio' in df.columns:
-        df.loc[is_internet, 'Medio'] = (
-            df.loc[is_internet, 'Medio']
-            .astype(str).str.lower().str.strip()
-            .map(internet_map)
-            .fillna(df.loc[is_internet, 'Medio'])
-        )
 
     df['ID Noticia'] = df.get('NoticiaId', df.get('ID Noticia', pd.Series(dtype=str)))
     df['Fecha'] = pd.to_datetime(df.get('Fecha', pd.Series(dtype=str)), dayfirst=True, errors='coerce').dt.normalize()
@@ -2786,7 +2690,14 @@ def read_and_normalize_dossier(sheet, region_map, internet_map):
     df['Sección - Programa'] = df.get('Sección - Programa', pd.Series(dtype=str)).astype(str).apply(clean_text)
     
     titulo_col = 'Título' if 'Título' in df.columns else 'Titulo'
-    df['Título'] = df.get(titulo_col, pd.Series(dtype=str)).astype(str).apply(clean_text)
+    if '_titulo_original' in df.columns:
+        df['Título'] = df['_titulo_original']
+    else:
+        raw_titles = []
+        for val in df.get(titulo_col, pd.Series(dtype=object)):
+            raw_titles.append(val.get("value") if isinstance(val, dict) else val)
+        df['_titulo_original'] = raw_titles
+        df['Título'] = raw_titles
     df['Autor - Conductor'] = df.get('Autor - Conductor', pd.Series(dtype=str)).astype(str).apply(clean_text)
     df['Nro. Pagina'] = df.get('Nro. Pagina', pd.Series(dtype=str))
     
@@ -2863,108 +2774,65 @@ def read_and_normalize_dossier(sheet, region_map, internet_map):
     return df
 
 def generate_output_excel(rows, km):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Resultado"
-    ORDER = [
-        "ID Noticia", "Fecha", "Hora", "Medio", "Tipo de Medio",
-        "Sección - Programa", "Región", "Título", "Autor - Conductor",
-        "Nro. Pagina", "Dimensión", "Duración - Nro. Caracteres",
-        "CPE", "Tier", "Audiencia", "Tono", "Tono IA", "Tema", "Subtema", "Grupo noticia",
-        "Link Nota", "Resumen - Aclaracion", "Link (Streaming - Imagen)", "Menciones - Empresa",
-        "ID duplicada",
-        "Cuerpo Completo"   # ── ADICIÓN: columna final con el CuerpoEs completo, sin truncar ──
-    ]
-    NUM = {"ID Noticia", "Nro. Pagina", "Dimensión", "Duración - Nro. Caracteres", "CPE", "Tier", "Audiencia"}
-    ORDER += ["Contexto analizado", "Coincidencia marca", "Origen coincidencia"]
-    ws.append(ORDER)
-    
-    font_hyperlink = Font(color="000000", underline=None)
-    align_left = Alignment(horizontal='left')
-    font_header = Font(bold=True)
-    
-    for i, col_name in enumerate(ORDER, start=1):
-        cell = ws.cell(row=1, column=i)
-        cell.font = font_header
-
-    col_idx_map = {name: ORDER.index(name) + 1 for name in ORDER}
-        
-    for row in rows:
-        ctx, match, origin = _brand_audit(row.get(km.get("titulo"), ""), row.get(km.get("resumen"), ""), st.session_state.get("brand_name", ""), st.session_state.get("brand_aliases", []))
-        row["Contexto analizado"], row["Coincidencia marca"], row["Origen coincidencia"] = ctx, match, origin
-        tk = km.get("titulo")
-        if tk and tk in row: row[tk] = clean_title_for_output(row.get(tk))
-        rk = km.get("resumen")
-        if rk and rk in row: row[rk] = corregir_texto(row.get(rk))
-        
-        out, links = [], {}
-        for ci, h in enumerate(ORDER, start=1):
-            dk = km.get(norm_key(h), norm_key(h))
-            val = row.get(h)
-            cv = None
-            
-            if h == 'Fecha' and pd.notna(val):
-                if isinstance(val, pd.Timestamp):
-                    cv = val.to_pydatetime()
-                elif isinstance(val, (datetime.datetime, datetime.date)):
-                    cv = val
-                else:
-                    cv = str(val) if val is not None else None
-            elif h in NUM:
-                cv = parse_numeric(val)
-            elif isinstance(val, dict) and "url" in val:
-                cv = val.get("value", "Link")
-                if val.get("url"): links[ci] = val["url"]
-            elif val is not None:
-                if isinstance(val, str) and val.startswith("http"):
-                    cv = "Link"
-                    links[ci] = val
-                else:
-                    cv = str(val)
-            out.append(cv)
-        ws.append(out)
-        
-        current_row = ws.max_row
-        for ci, url in links.items():
-            cell = ws.cell(row=current_row, column=ci)
-            cell.hyperlink = url
-            cell.font = font_hyperlink
-            cell.alignment = align_left
-            
-        date_col_idx = ORDER.index("Fecha") + 1
-        date_cell = ws.cell(row=current_row, column=date_col_idx)
-        if isinstance(date_cell.value, (datetime.datetime, datetime.date)):
-            date_cell.number_format = 'DD/MM/YYYY'
-            
-        cols_millares = ["Nro. Pagina", "Dimensión", "Duración - Nro. Caracteres", "Tier", "Audiencia"]
-        for col_name in cols_millares:
-            col_idx = col_idx_map[col_name]
-            cell = ws.cell(row=current_row, column=col_idx)
-            if isinstance(cell.value, (int, float)):
-                cell.number_format = '#,##0'
-
-        cpe_idx = col_idx_map["CPE"]
-        cpe_cell = ws.cell(row=current_row, column=cpe_idx)
-        if isinstance(cpe_cell.value, (int, float)):
-            cpe_cell.number_format = '$#,##0'
-            
-    for i, col_name in enumerate(ORDER, start=1):
-        letter = ws.cell(row=1, column=i).column_letter
-        if col_name in ['Título', 'Resumen - Aclaracion', 'Cuerpo Completo']:
-            ws.column_dimensions[letter].width = 50
-        elif col_name in ['Link Nota', 'Link (Streaming - Imagen)']:
-            ws.column_dimensions[letter].width = 15
-        else:
-            ws.column_dimensions[letter].width = 20
-            
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
+    """Exact output schema. Título is the original cell; hyperlinks restored."""
+    return generate_output_excel_core(rows, km)
 
 
 # ======================================
 # Proceso principal
 # ======================================
+def _core_embed_fn(textos):
+    return get_embeddings_batch(textos)
+
+def _core_chat_fn(prompt):
+    resp = call_with_retries(
+        openai.ChatCompletion.create,
+        model=OPENAI_MODEL_CLASIFICACION,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=3500,
+        temperature=0.0,
+        response_format={"type": "json_object"},
+        request_timeout=REQUEST_TIMEOUT_S,
+    )
+    u = resp.get('usage', {}) if isinstance(resp, dict) else getattr(resp, 'usage', {})
+    if u:
+        st.session_state['tokens_input'] += (u.get('prompt_tokens') if isinstance(u, dict) else getattr(u, 'prompt_tokens', 0)) or 0
+        st.session_state['tokens_output'] += (u.get('completion_tokens') if isinstance(u, dict) else getattr(u, 'completion_tokens', 0)) or 0
+    content = resp.choices[0].message.content
+    try:
+        return json.loads(content)
+    except Exception:
+        return content
+
+def _df_rows_for_core(df, title_col, resumen_col, cuerpo_col=None):
+    rows = []
+    for i, rec in df.iterrows():
+        titulo = rec.get(title_col, "")
+        rows.append({
+            "ID Noticia": rec.get("ID Noticia", i),
+            "Fecha": rec.get("Fecha", ""),
+            "Hora": rec.get("Hora", ""),
+            "Medio": rec.get("Medio", ""),
+            "Tipo de Medio": rec.get("Tipo de Medio", "Internet"),
+            "Sección - Programa": rec.get("Sección - Programa", ""),
+            "Región": rec.get("Región", ""),
+            "Título": titulo,
+            "_titulo_original": titulo,
+            "Tono IA": rec.get("Tono IA", ""),
+            "Tema": rec.get("Tema", ""),
+            "Subtema": rec.get("Subtema", ""),
+            "Link Nota": rec.get("Link Nota"),
+            "Resumen - Aclaracion": rec.get(resumen_col, ""),
+            "Link (Streaming - Imagen)": rec.get("Link (Streaming - Imagen)"),
+            "Menciones - Empresa": rec.get("Menciones - Empresa", ""),
+            "ID duplicada": rec.get("ID duplicada", ""),
+            "Cuerpo Completo": rec.get(cuerpo_col or "Cuerpo Completo", ""),
+            "Tono": rec.get("Tono", ""),
+            "is_duplicate": False,
+            "_src_index": i,
+        })
+    return rows
+
 async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=None, cliente="", voceros="", enable_scraping=False):
     st.session_state.update({'tokens_input': 0, 'tokens_output': 0, 'tokens_embedding': 0})
     get_embedding_cache().clear()
@@ -2981,7 +2849,7 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
     with st.status("Paso 1 · Carga de Configuración y Dossier", expanded=True) as s:
         region_map, internet_map = load_config_from_sheets()
 
-        wb_in = load_workbook(df_file, data_only=True)
+        wb_in = load_workbook(df_file, data_only=False)
         df_normalized = read_and_normalize_dossier(wb_in.active, region_map, internet_map)
 
         medios_sin_region = sorted(set(
@@ -3037,76 +2905,37 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
             "idduplicada": "ID duplicada"
         }
         
-        rows = detectar_duplicados_avanzado(rows_expanded, km)
-        for row in rows:
-            if row["is_duplicate"]:
-                row["Tono IA"] = "Duplicada"
-                row["Tema"] = "-"
-                row["Subtema"] = "-"
-                
-        s.update(label="✓ Paso 1 completado", state="complete")
-        
-    with st.status("Paso 2 · Normalización", expanded=True) as s:
-        s.update(label="✓ Paso 2 · Mapeos y normalizaciones aplicados", state="complete")
-        
+        s.update(label="✓ Limpieza · dossier y BUSCARV aplicados", state="complete")
+
+    use_api = "API" in mode or "Híbrido" in mode
+    chat_fn = _core_chat_fn if use_api and "Solo Modelos PKL" not in mode else None
+    pkl_tono_fn = None
+    pkl_tema_fn = None
+    if tpkl:
+        def pkl_tono_fn(ctxs, _pkl=tpkl):
+            raw = analizar_tono_con_pkl(ctxs, _pkl, marca=bn, aliases=ba)
+            return raw
+    if epkl:
+        def pkl_tema_fn(ctxs, _pkl=epkl):
+            return analizar_temas_con_pkl(ctxs, _pkl)
+
+    with st.status("Duplicados → Contexto → Embedding único → Agrupación → Tono → Tema/Subtema", expanded=True) as s:
+        pb = st.progress(0)
+        rows, tracker = process_pipeline(
+            rows_expanded, bn, ba, km=km,
+            embed_fn=_core_embed_fn if use_api or tpkl or epkl else None,
+            chat_fn=chat_fn,
+            pkl_tono_fn=pkl_tono_fn,
+            pkl_tema_fn=pkl_tema_fn,
+        )
+        for i, ev in enumerate(tracker.events, start=1):
+            pb.progress(i / max(len(tracker.events), 1), ev["label"])
+            s.write(ev["label"])
+        st.session_state["pipeline_profile"] = tracker.summary()
+        s.update(label=f"✓ Pipeline · chat={tracker.calls.chat} · emb={tracker.calls.embed} · pares={tracker.comparisons.n}", state="complete")
+
     gc.collect()
     ta = [r for r in rows if not r.get("is_duplicate")]
-    
-    if ta:
-        df = pd.DataFrame(ta)
-        df["_txt"] = df.apply(
-            lambda r: texto_para_embedding(str(r.get(km["titulo"], "")), str(r.get(km["resumen"], ""))),
-            axis=1
-        )
-        with st.status("Embeddings...", expanded=True) as s:
-            _ = get_embeddings_batch(df["_txt"].tolist())
-            s.update(label=f"✓ {get_embedding_cache().stats()}", state="complete")
-            
-        with st.status("Paso 3 · Tono (Reputación)", expanded=True) as s:
-            pb = st.progress(0)
-            if ("PKL" in mode or tpkl) and tpkl:
-                res = analizar_tono_con_pkl(
-                    df["_txt"].tolist(), tpkl,
-                    titulos=df[km["titulo"]], resumenes=df[km["resumen"]],
-                    marca=bn, aliases=ba,
-                )
-                if res is None: st.stop()
-            elif "API" in mode or "Híbrido" in mode:
-                res = await ClasificadorTono(bn, ba).procesar_lote_async(
-                    df["_txt"], pb, df[km["resumen"]], df[km["titulo"]]
-                )
-            else:
-                res = [{"tono": "N/A"}] * len(ta)
-            df[km["tonoiai"]] = [r["tono"] for r in res]
-            s.update(label="✓ Paso 3 · Tono (Reputación)", state="complete")
-            
-        with st.status("Paso 4 · Clasificación", expanded=True) as s:
-            pb = st.progress(0)
-            if "Solo Modelos PKL" in mode:
-                subtemas = ["N/A"] * len(ta)
-                temas    = ["N/A"] * len(ta)
-            else:
-                subtemas = ClasificadorSubtema(bn, ba).procesar_lote(
-                    df["_txt"], pb, df[km["resumen"]], df[km["titulo"]]
-                )
-                temas = consolidar_temas(subtemas, df["_txt"].tolist(), pb, bn)
-            df[km["subtema"]] = subtemas
-            if epkl:
-                tp = analizar_temas_con_pkl(df["_txt"].tolist(), epkl)
-                if tp: df[km["tema"]] = tp
-            else:
-                df[km["tema"]] = temas
-            df[km["tema"]] = _unificar_tema_por_subtema(df[km["tema"]].tolist(), df[km["subtema"]].tolist())
-            df = aplicar_consistencia_grupos(df, km["titulo"], km["resumen"],
-                                             km["tonoiai"], km["tema"], km["subtema"])
-            s.update(label="✓ Paso 4 · Clasificación", state="complete")
-            
-        rm2 = df.set_index("expanded_index").to_dict("index")
-        for idx, row in enumerate(rows):
-            if not row.get("is_duplicate"):
-                row.update(rm2.get(row.get("expanded_index"), {}))
-                
-    gc.collect()
     ci = (st.session_state['tokens_input']     / 1e6) * PRICE_INPUT_1M
     co = (st.session_state['tokens_output']    / 1e6) * PRICE_OUTPUT_1M
     ce = (st.session_state['tokens_embedding'] / 1e6) * PRICE_EMBEDDING_1M
@@ -3122,33 +2951,31 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
             "total_rows": len(rows), "unique_rows": len(ta), "duplicates": len(rows) - len(ta),
             "process_duration": f"{time.time() - t0:.0f}s",
             "process_cost": f"${ci + co + ce:.4f} USD",
-            "cache_stats": get_embedding_cache().stats()
+            "cache_stats": get_embedding_cache().stats(),
+            "pipeline_profile": st.session_state.get("pipeline_profile", ""),
         })
-        s.update(label=f"✓ Completado · {get_embedding_cache().stats()}", state="complete")
+        s.update(label=f"✓ Excel · {get_embedding_cache().stats()}", state="complete")
 
 async def run_quick_async(df, tc, sc, bn, al):
     st.session_state.update({'tokens_input': 0, 'tokens_output': 0, 'tokens_embedding': 0})
     get_embedding_cache().clear()
-    df['_txt'] = df.apply(lambda r: texto_para_embedding(str(r.get(tc, "")), str(r.get(sc, ""))), axis=1)
-    with st.status("Embeddings...", expanded=True) as s:
-        _ = get_embeddings_batch(df['_txt'].tolist())
-        s.update(label=f"✓ {get_embedding_cache().stats()}", state="complete")
-    with st.status("Tono", expanded=True) as s:
-        pb = st.progress(0)
-        res = await ClasificadorTono(bn, al).procesar_lote_async(df["_txt"], pb, df[sc].fillna(''), df[tc].fillna(''))
-        df['Tono IA'] = [r["tono"] for r in res]
-        audits = [_brand_audit(r.get(tc, ''), r.get(sc, ''), bn, al) for _, r in df.iterrows()]
-        df['Contexto analizado'], df['Coincidencia marca'], df['Origen coincidencia'] = zip(*audits)
-        s.update(label="✓ Tono", state="complete")
-    with st.status("Clasificación", expanded=True) as s:
-        pb = st.progress(0)
-        subtemas = ClasificadorSubtema(bn, al).procesar_lote(df["_txt"], pb, df[sc].fillna(''), df[tc].fillna(''))
-        df['Subtema'] = subtemas
-        temas = consolidar_temas(subtemas, df["_txt"].tolist(), pb, bn)
-        df['Tema'] = _unificar_tema_por_subtema(temas, subtemas)
-        df = aplicar_consistencia_grupos(df, tc, sc)
-        s.update(label="✓ Clasificación", state="complete")
-    df.drop(columns=['_txt'], inplace=True)
+    rows = _df_rows_for_core(df, tc, sc)
+    with st.status("Limpieza · Duplicados · Contexto · Embedding único · Agrupación · Tono · Tema/Subtema", expanded=True) as s:
+        out, tracker = process_pipeline(
+            rows, bn, al, embed_fn=_core_embed_fn, chat_fn=_core_chat_fn,
+        )
+        for ev in tracker.events:
+            s.write(ev["label"])
+        s.update(label=f"✓ chat={tracker.calls.chat} · emb={tracker.calls.embed}", state="complete")
+    df = df.copy()
+    df['Tono IA'] = [r.get("Tono IA", "") for r in out]
+    df['Tema'] = [r.get("Tema", "") for r in out]
+    df['Subtema'] = [r.get("Subtema", "") for r in out]
+    df['Grupo noticia'] = [r.get("Grupo noticia", "") for r in out]
+    df['Contexto analizado'] = [r.get("Contexto analizado", "") for r in out]
+    df['Coincidencia marca'] = [r.get("Coincidencia marca", "") for r in out]
+    df['Origen coincidencia'] = [r.get("Origen coincidencia", "") for r in out]
+    df[tc] = [r.get("_titulo_original", r.get(tc)) for r in out]
     ci = (st.session_state['tokens_input']     / 1e6) * PRICE_INPUT_1M
     co = (st.session_state['tokens_output']    / 1e6) * PRICE_OUTPUT_1M
     ce = (st.session_state['tokens_embedding'] / 1e6) * PRICE_EMBEDDING_1M
@@ -3254,68 +3081,30 @@ async def run_custom_excel_async(file_bytes, tc, sc, bn, al, mode="API de OpenAI
     buf_in.seek(0)
     df = pd.read_excel(buf_in)
 
-    df['_txt'] = df.apply(
-        lambda r: texto_para_embedding(str(r.get(tc, "")), str(r.get(sc, ""))),
-        axis=1
-    )
-
-    with st.status("Paso 1 · Generando Embeddings...", expanded=True) as s:
-        _ = get_embeddings_batch(df['_txt'].tolist())
-        s.update(label=f"✓ Embeddings listos · {get_embedding_cache().stats()}", state="complete")
-
-    # --- PASO 2: TONO ---
-    with st.status("Paso 2 · Evaluando Tono (Reputación)...", expanded=True) as s:
-        pb = st.progress(0)
-        if tpkl:
-            # PKL de tono: predecir sobre la mención a Marca principal / Alias, no el artículo entero.
-            res = analizar_tono_con_pkl(
-                df["_txt"].tolist(), tpkl,
-                titulos=df[tc].fillna(""), resumenes=df[sc].fillna(""),
-                marca=bn, aliases=al,
-            )
-            if res is None: st.stop()
-            tonos = [r["tono"] for r in res]
-        elif "API" in mode or "Híbrido" in mode:
-            res = await ClasificadorTono(bn, al).procesar_lote_async(
-                df["_txt"], pb, df[sc].fillna(''), df[tc].fillna('')
-            )
-            tonos = [r["tono"] for r in res]
-        else:
-            tonos = ["N/A"] * len(df)
-        df['Tono IA'] = tonos
-        audits = [_brand_audit(r.get(tc, ''), r.get(sc, ''), bn, al) for _, r in df.iterrows()]
-        df['Contexto analizado'], df['Coincidencia marca'], df['Origen coincidencia'] = zip(*audits)
-        s.update(label="✓ Tono IA evaluado", state="complete")
-
-    # --- PASO 3: SUBTEMAS Y TEMAS ---
-    with st.status("Paso 3 · Clasificando Subtemas y Temas...", expanded=True) as s:
-        pb = st.progress(0)
-        
-        # Subtemas
-        if "Solo Modelos PKL" in mode:
-            subtemas = ["N/A"] * len(df)
-        else:
-            subtemas = ClasificadorSubtema(bn, al).procesar_lote(
-                df["_txt"], pb, df[sc].fillna(''), df[tc].fillna('')
-            )
-
-        # Temas
-        if epkl:
-            # Si se subió PKL de Temas, usar las predicciones directas del modelo
-            tp = analizar_temas_con_pkl(df["_txt"].tolist(), epkl)
-            if tp:
-                temas = tp
-            else:
-                temas = ["N/A"] * len(df)
-        elif "Solo Modelos PKL" in mode:
-            temas = ["N/A"] * len(df)
-        else:
-            temas = consolidar_temas(subtemas, df["_txt"].tolist(), pb, bn)
-
-        df['Subtema'] = subtemas
-        df['Tema']    = _unificar_tema_por_subtema(temas, subtemas)
-        df = aplicar_consistencia_grupos(df, tc, sc)
-        s.update(label="✓ Clasificación completada", state="complete")
+    rows = _df_rows_for_core(df, tc, sc)
+    use_api = "API" in mode or "Híbrido" in mode
+    chat_fn = _core_chat_fn if use_api and "Solo Modelos PKL" not in mode else None
+    pkl_tono_fn = (lambda ctxs, _pkl=tpkl: analizar_tono_con_pkl(ctxs, _pkl, marca=bn, aliases=al)) if tpkl else None
+    pkl_tema_fn = (lambda ctxs, _pkl=epkl: analizar_temas_con_pkl(ctxs, _pkl)) if epkl else None
+    with st.status("Limpieza · Duplicados · Contexto · Embedding único · Agrupación · Tono · Tema/Subtema", expanded=True) as s:
+        out, tracker = process_pipeline(
+            rows, bn, al,
+            embed_fn=_core_embed_fn if use_api or tpkl or epkl else None,
+            chat_fn=chat_fn,
+            pkl_tono_fn=pkl_tono_fn,
+            pkl_tema_fn=pkl_tema_fn,
+        )
+        for ev in tracker.events:
+            s.write(ev["label"])
+        s.update(label=f"✓ chat={tracker.calls.chat} · emb={tracker.calls.embed}", state="complete")
+    df = df.copy()
+    df['Tono IA'] = [r.get("Tono IA", "") for r in out]
+    df['Tema'] = [r.get("Tema", "") for r in out]
+    df['Subtema'] = [r.get("Subtema", "") for r in out]
+    df['Grupo noticia'] = [r.get("Grupo noticia", "") for r in out]
+    df['Contexto analizado'] = [r.get("Contexto analizado", "") for r in out]
+    df['Coincidencia marca'] = [r.get("Coincidencia marca", "") for r in out]
+    df['Origen coincidencia'] = [r.get("Origen coincidencia", "") for r in out]
 
     # Escribir las 3 columnas adicionales al final en la hoja openpyxl respetando el formato original
     max_col = ws.max_column
@@ -3334,6 +3123,8 @@ async def run_custom_excel_async(file_bytes, tc, sc, bn, al, mode="API de OpenAI
     ws.cell(row=1, column=col_contexto, value="Contexto analizado").font = font_bold
     ws.cell(row=1, column=col_coincidencia, value="Coincidencia marca").font = font_bold
     ws.cell(row=1, column=col_origen, value="Origen coincidencia").font = font_bold
+    col_grupo = max_col + 7
+    ws.cell(row=1, column=col_grupo, value="Grupo noticia").font = font_bold
 
     # Asignar valores por fila manteniendo la coincidencia exacta
     for idx, row_data in df.iterrows():
@@ -3344,6 +3135,7 @@ async def run_custom_excel_async(file_bytes, tc, sc, bn, al, mode="API de OpenAI
         ws.cell(row=r, column=col_contexto, value=str(row_data['Contexto analizado']))
         ws.cell(row=r, column=col_coincidencia, value=str(row_data['Coincidencia marca']))
         ws.cell(row=r, column=col_origen, value=str(row_data['Origen coincidencia']))
+        ws.cell(row=r, column=col_grupo, value=str(row_data.get('Grupo noticia', '')))
 
     buf_out = io.BytesIO()
     wb.save(buf_out)
@@ -3531,7 +3323,7 @@ def main():
         <div class="app-header-icon">◈</div>
         <div class="app-header-text">
             <div class="app-header-title">Análisis de Noticias - API</div>
-            <div class="app-header-version">v18.5 · 😼 Realizado por Johnathan Cortés 🕵️‍♂️ </div>
+            <div class="app-header-version">v18.6 · 😼 Realizado por Johnathan Cortés 🕵️‍♂️ </div>
         </div>
         <div class="app-header-badge">IA</div>
     </div>""", unsafe_allow_html=True)
@@ -3644,6 +3436,8 @@ def main():
               <div class="metric-card m-cost"><div class="metric-val" style="color:var(--accent)">{cost}</div><div class="metric-lbl">Costo</div></div>
             </div>""", unsafe_allow_html=True)
             if 'cache_stats' in st.session_state: st.caption(f"📊 {st.session_state['cache_stats']}")
+            if st.session_state.get("pipeline_profile"):
+                st.caption(f"⏱ {st.session_state['pipeline_profile']}")
             c1, c2 = st.columns(2)
             c1.download_button(
                 "⬇ Descargar informe",
@@ -3669,7 +3463,7 @@ def main():
         render_sentiment_tab()
 
     st.markdown(
-        '<div class="footer">v18.2 · Análisis de Noticias con IA · Johnathan Cortés ©</div>',
+        '<div class="footer">v18.6 · Análisis de Noticias con IA · Johnathan Cortés ©</div>',
         unsafe_allow_html=True
     )
 
