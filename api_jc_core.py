@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import html
 import io
 import json
 import re
@@ -42,13 +43,17 @@ MAX_RETRIES = 2
 MAX_BUCKET = 80
 MAX_PAIRS_TOTAL = 40000
 MAX_CMP_CHARS = 400
-SIMILARITY_THRESHOLD_TITULOS = 0.92
+SIMILARITY_THRESHOLD_TITULOS = 0.84
 SIMILARITY_THRESHOLD_TITULOS_BCAST = 0.86
 SIMILARITY_THRESHOLD_RESUMEN = 0.86
 SIMILARITY_THRESHOLD_SEMANTIC = 0.88
+SIMILARITY_SEMANTIC_ALONE = 0.93
 MIN_OVERLAP_GRUPO = 0.30
-MAX_PALABRAS_SUBTEMA = 7
+JACCARD_TITULO_GRUPO = 0.70
+EMBED_CANDIDATE_MIN = 0.82
+MAX_PALABRAS_SUBTEMA = 9
 MIN_PALABRAS_SUBTEMA = 3
+MAX_PALABRAS_TEMA = 5
 
 OUTPUT_COLUMNS = [
     "ID Noticia",
@@ -146,7 +151,82 @@ _CONJUGATED_TAILS = {
     "advierten", "advierte", "revelan", "revela", "ocurren", "ocurre",
     "registran", "registra", "mueren", "muere", "resultan", "resulta",
     "quedan", "queda", "llegan", "llega", "inician", "inicia",
+    "tendra", "tendran", "tiene", "tienen", "sera", "seran", "esta", "estan",
+    "hay", "va", "van", "hace", "hacen", "dice", "dicen", "pide", "piden",
+    "busca", "buscan", "deja", "dejan", "cae", "caen", "sube", "suben",
+    "crece", "crecen", "gana", "ganan", "pierde", "pierden", "abre", "abren",
+    "cierra", "cierran", "entrega", "entregan", "recibe", "reciben",
+    "vive", "viven", "cumple", "cumplen", "ofrece", "ofrecen", "logra", "logran",
+    "quiere", "quieren", "puede", "pueden", "debe", "deben", "sigue", "siguen",
+    "vuelve", "vuelven", "sale", "salen", "pasa", "pasan", "pone", "ponen",
+    "firma", "firman", "aprueba", "aprueban", "rechaza", "rechazan",
+    "denuncia", "denuncian", "alerta", "alertan", "celebra", "celebran",
+    "invierte", "invierten", "impulsa", "impulsan", "lidera", "lideran",
+    "explica", "explican", "analiza", "analizan", "promueve", "promueven",
+    "realiza", "realizan", "suspende", "suspenden", "activa", "activan",
+    "refuerza", "refuerzan", "amplia", "amplian", "reduce", "reducen",
+    "asegura", "aseguran", "afirma", "afirman", "inaugura", "inauguran",
+    "es", "son", "fue", "fueron", "era", "eran", "sido", "estara", "estaran",
+    "habra", "podra", "podran", "debera", "deberan", "hara", "haran",
+    "dara", "daran", "ira", "iran", "vendra", "vendran", "llegara", "llegaran",
 }
+
+_SUFIJO_VERBO_RE = re.compile(
+    r"(?:ar[áa]n?|er[áa]n?|ir[áa]n?|r[áa]s|aron|ieron|aban|[áa]bamos|[íi]amos|"
+    r"iendo|yendo|[óo]|amos|emos|imos)$"
+)
+_NOMBRES_TERMINADOS_O = {
+    "balance", "gobierno", "proyecto", "programa", "convenio", "acuerdo", "aumento",
+    "cierre", "cambio", "riesgo", "impacto", "reto", "hecho", "caso", "costo",
+    "presupuesto", "desarrollo", "manejo", "apoyo", "respaldo", "rechazo", "anuncio",
+    "lanzamiento", "reconocimiento", "premio", "logro", "trabajo", "empleo", "comercio",
+    "consumo", "transporto", "plazo", "estado", "mercado", "operativo", "dispositivo",
+    "estudio", "informe", "resultado", "registro", "aniversario", "concurso",
+    "torneo", "campeonato", "partido", "público", "privado", "sector", "puesto",
+    "terremoto", "sismo", "incendio", "secuestro", "hurto", "robo", "homicidio",
+    "acueducto", "alcantarillado", "aeropuerto", "puerto", "metro", "recorrido",
+    "ingreso", "descuento", "subsidio", "bono", "seguro", "crédito", "credito",
+    "servicio", "comercio", "negocio", "consorcio", "municipio", "departamento",
+    "territorio", "barrio", "centro", "colegio", "liceo", "instituto", "museo", "teatro",
+    "concierto", "festival", "evento", "encuentro", "foro", "congreso", "diálogo", "dialogo",
+    "conflicto", "ataque", "atentado", "operativo", "hallazgo", "rescate", "cuerpo",
+    "gasto", "ahorro", "pago", "cobro", "recaudo", "trámite", "tramite", "periodo",
+    "modelo", "diseño", "diseno", "producto", "alimento", "medicamento", "tratamiento",
+    "nombramiento", "reglamento", "documento", "monumento", "instrumento",
+}
+
+
+def _es_verbo_conjugado(palabra: str) -> bool:
+    """Heuristic: known conjugated forms or verbal suffixes (tendrá, anunció,
+    ascienden, cayeron). Common nouns ending in -o are whitelisted."""
+    raw = str(palabra).lower().strip(".,;:!?¿¡\"'")
+    w = unidecode(raw)
+    if not w:
+        return False
+    if w in _CONJUGATED_TAILS:
+        return True
+    # Accented preterite / future (anunció, cayó, tendrá) is decided on the
+    # raw form first: 'anunció' must not be whitelisted as the noun 'anuncio'.
+    if re.search(r"(?:ó|á)$", raw) and len(raw) >= 4 and raw not in {"está", "acá", "allá", "quizá", "ojalá", "sofá", "papá", "mamá", "bogotá", "cúcuta", "panamá", "canadá"}:
+        return True
+    if w in _NOMBRES_TERMINADOS_O or w in STOPWORDS_ES:
+        return False
+    if len(w) <= 3:
+        return False
+    if re.search(r"(?:ar|er|ir)[áa]n?$", w) and len(w) >= 6:
+        return True
+    if re.search(r"(?:aron|ieron|eron|aban|iendo|yendo)$", w):
+        return True
+    return False
+
+
+def _parece_adjetivo(palabra: str) -> bool:
+    w = unidecode(str(palabra).lower().strip(".,;:"))
+    return bool(re.search(
+        r"(?:al|ales|ar|ares|ico|ica|icos|icas|ivo|iva|ivos|ivas|oso|osa|osos|osas|"
+        r"ble|bles|ante|antes|ente|entes|ario|aria|arios|arias|ense|enses|eno|ena|"
+        r"ano|ana|anos|anas|ial|iales|orio|oria|orios|orias|ista|istas|il|iles|"
+        r"estre|estres|uro|ura|uros|uras|ero|era|eros|eras)$", w))
 
 _NEXOS = {
     "de", "del", "para", "sobre", "en", "con", "por", "ante", "hacia",
@@ -318,10 +398,26 @@ def titulo_original(valor: Any) -> Any:
     return valor
 
 
+_PREFIJO_CANAL_RE = re.compile(
+    r"^\s*(?:video|en vivo|vivo|audio|streaming|podcast|galer[ií]a|fotos?|"
+    r"opini[oó]n|editorial|exclusivo|urgente|[uú]ltima hora|breaking|columna)\s*[\|:\-–—]\s*",
+    re.I,
+)
+
+
 def normalize_title_for_comparison(title: Any) -> str:
+    """Internal-only copy for matching: strips HTML, channel prefixes
+    ('Video |', 'En vivo:') and trailing source segments ('| El País',
+    '- Semana'). The output Título is never touched by this."""
     if not isinstance(title, str):
         title = "" if title is None else str(title)
-    cleaned = unidecode(title)
+    t = re.sub(r"<[^>]+>", " ", title)
+    t = html.unescape(t) if hasattr(html, "unescape") else t
+    for _ in range(2):
+        t = _PREFIJO_CANAL_RE.sub("", t)
+    # Trailing " | Fuente" / " - Fuente" / " – Fuente" of up to 5 words.
+    t = re.sub(r"\s+[\|–—-]\s+(?:[^\|–—-]\S*\s*){1,5}$", "", t).strip()
+    cleaned = unidecode(t)
     return re.sub(r"\W+", " ", cleaned).lower().strip()
 
 
@@ -455,6 +551,30 @@ def _tokens_distintivos(texto: str, min_len: int = 4) -> set:
     }
 
 
+_SUFIJOS_ES = (
+    "aciones", "iciones", "amiento", "imiento", "adores", "edores", "idores",
+    "mente", "aron", "ieron", "aban", "ian", "ando", "iendo", "ados", "idos",
+    "adas", "idas", "ados", "acion", "icion", "ador", "edor", "idor", "aron",
+    "ara", "era", "ira", "aran", "eran", "iran", "ado", "ida", "ido", "ada",
+    "an", "en", "es", "os", "as", "ar", "er", "ir", "o", "a", "e", "s",
+)
+
+
+def _stem_es(tok: str) -> str:
+    """Light Spanish stemmer for matching only (destacan/destacaron → destac)."""
+    t = unidecode(str(tok).lower())
+    if len(t) <= 4:
+        return t
+    for suf in _SUFIJOS_ES:
+        if t.endswith(suf) and len(t) - len(suf) >= 4:
+            return t[: len(t) - len(suf)]
+    return t
+
+
+def _stems(tokens: Iterable[str]) -> set:
+    return {_stem_es(t) for t in tokens}
+
+
 def _overlap_distintivo(a: str, b: str) -> float:
     ta, tb = _tokens_distintivos(a), _tokens_distintivos(b)
     if not ta or not tb:
@@ -516,23 +636,33 @@ def _mencion_key(row: Dict[str, Any], km: Dict[str, str]) -> str:
 def detectar_duplicados(rows: Sequence[Dict[str, Any]],
                         km: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
     """
-    Internet/prensa: duplicate only if the embedded Link Nota URL matches
-    (normalized). Same title + different URL/media is NOT a duplicate.
+    Duplicate = same publication, decided before any LLM call. Rules:
 
-    Radio/TV: similar title AND same Fecha AND same Hora.
-    Medio is NOT required — the same syndicated broadcast can air on
-    several outlets; requiring Medio would miss those (existing code
-    keyed on medio+hora+mencion and ignored title/fecha).
-    Mención is kept so the dossier expansion (one row per company) does
-    not mark two companies on the same note as duplicates of each other.
+    1. Any type: same embedded link in `Link (Streaming - Imagen)` AND same
+       `Menciones - Empresa` → duplicate, even if the title differs.
+    2. Internet/prensa/revistas: same normalized embedded URL in `Link Nota`
+       AND same mención → duplicate. Same title with another URL is NOT.
+    3. Radio/TV: same mención AND same Medio AND same Fecha AND same Hora
+       → duplicate, title equal or different (same broadcast slot).
+
+    Similar titles alone never mark a duplicate; that is Grupo noticia.
+    Mención is part of every key so the dossier expansion (one row per
+    company) never marks two companies of the same note as duplicates.
     """
     km = km or KEYMAP
     processed = deepcopy(list(rows))
+    seen_stream: Dict[Tuple[str, str], int] = {}
     seen_url: Dict[Tuple[str, str], int] = {}
     seen_bcast: Dict[Tuple[str, str, str, str], int] = {}
-    # (mencion, fecha, hora) -> [(titulo_norm, idx)] so similar-title checks
-    # only scan the same broadcast slot, never the whole dossier.
-    bcast_slot: Dict[Tuple[str, str, str], List[Tuple[str, int]]] = defaultdict(list)
+
+    def _marcar(row: Dict[str, Any], orig_idx: int) -> None:
+        orig = processed[orig_idx]
+        row["is_duplicate"] = True
+        row["_dup_of_index"] = orig_idx
+        row[km.get("idduplicada", "ID duplicada")] = orig.get(km.get("idnoticia", "ID Noticia"), "")
+        row["Tono IA"] = "Duplicada"
+        row["Tema"] = "-"
+        row["Subtema"] = "-"
 
     for i, row in enumerate(processed):
         row.setdefault("is_duplicate", False)
@@ -540,54 +670,44 @@ def detectar_duplicados(rows: Sequence[Dict[str, Any]],
             continue
         tipo = normalizar_tipo_medio(row.get(km.get("tipodemedio", "Tipo de Medio"), ""))
         mencion = _mencion_key(row, km)
+
+        stream = normalize_url(url_de_celda_link(row.get(km.get("link_streaming", "Link (Streaming - Imagen)"))))
+        if stream:
+            sk = (stream, mencion)
+            if sk in seen_stream:
+                _marcar(row, seen_stream[sk])
+                continue
+            seen_stream[sk] = i
+
         if tipo in ("Internet", "Prensa", "Revistas"):
             url = normalize_url(url_de_celda_link(row.get(km.get("link_nota", "Link Nota"))))
             if not url:
                 continue
             key = (url, mencion)
             if key in seen_url:
-                orig = processed[seen_url[key]]
-                row["is_duplicate"] = True
-                row[km.get("idduplicada", "ID duplicada")] = orig.get(km.get("idnoticia", "ID Noticia"), "")
-                row["Tono IA"] = "Duplicada"
-                row["Tema"] = "-"
-                row["Subtema"] = "-"
+                _marcar(row, seen_url[key])
             else:
                 seen_url[key] = i
         elif tipo in ("Radio", "Televisión"):
-            titulo = normalize_title_for_comparison(row.get(km.get("titulo", "Título"), ""))
+            # The dossier maps the AV clip link into Link Nota: same embedded
+            # clip + same mención is the same emission regardless of title.
+            clip = normalize_url(url_de_celda_link(row.get(km.get("link_nota", "Link Nota"))))
+            if clip:
+                ck = (clip, mencion)
+                if ck in seen_stream:
+                    _marcar(row, seen_stream[ck])
+                    continue
+                seen_stream[ck] = i
+            medio = _norm_text(row.get(km.get("medio", "Medio"), ""))
             fecha = normalizar_fecha(row.get(km.get("fecha", "Fecha"), ""))
             hora = normalizar_hora(row.get(km.get("hora", "Hora"), ""))
-            if not (titulo and fecha and hora):
+            if not (medio and hora):
                 continue
-            exact = (mencion, fecha, hora, titulo)
-            if exact in seen_bcast:
-                orig = processed[seen_bcast[exact]]
-                row["is_duplicate"] = True
-                row[km.get("idduplicada", "ID duplicada")] = orig.get(km.get("idnoticia", "ID Noticia"), "")
-                row["Tono IA"] = "Duplicada"
-                row["Tema"] = "-"
-                row["Subtema"] = "-"
-                continue
-            matched = None
-            for p_tit, prev_i in bcast_slot.get((mencion, fecha, hora), []):
-                contained = (
-                    len(titulo) >= 20 and len(p_tit) >= 20
-                    and (titulo in p_tit or p_tit in titulo)
-                )
-                if contained or _ratio(titulo, p_tit, SIMILARITY_THRESHOLD_TITULOS_BCAST) >= SIMILARITY_THRESHOLD_TITULOS_BCAST:
-                    matched = prev_i
-                    break
-            if matched is not None:
-                orig = processed[matched]
-                row["is_duplicate"] = True
-                row[km.get("idduplicada", "ID duplicada")] = orig.get(km.get("idnoticia", "ID Noticia"), "")
-                row["Tono IA"] = "Duplicada"
-                row["Tema"] = "-"
-                row["Subtema"] = "-"
+            slot = (mencion, medio, fecha, hora)
+            if slot in seen_bcast:
+                _marcar(row, seen_bcast[slot])
             else:
-                seen_bcast[exact] = i
-                bcast_slot[(mencion, fecha, hora)].append((titulo, i))
+                seen_bcast[slot] = i
     return processed
 
 
@@ -756,19 +876,67 @@ def _prefix(text: str, words: int) -> str:
 
 
 def _candidate_pairs(n: int, buckets: Dict[str, List[int]],
-                     counter: Optional[ComparisonCounter] = None
+                     counter: Optional[ComparisonCounter] = None,
+                     token_sets: Optional[Sequence[set]] = None,
+                     unit_matrix: Optional[np.ndarray] = None,
                      ) -> List[Tuple[int, int]]:
+    """Blocked candidate generation (Python-level work stays << n²).
+
+    - Exact buckets (title prefix, resumen prefix, URL, date+time) are
+      never skipped: identical headlines must always meet.
+    - Token buckets: pairs sharing ≥2 distinctive tokens, or 1 rare token
+      (df ≤ 6), via posting-list co-occurrence counts.
+    - Embedding neighbours: one vectorised matrix product; pairs with
+      cosine ≥ EMBED_CANDIDATE_MIN join the candidate set.
+    """
     pares = set()
-    # Smallest buckets first: the most specific evidence wins the pair budget.
-    for idxs in sorted(buckets.values(), key=len):
-        if len(idxs) < 2 or len(idxs) > MAX_BUCKET:
+    for key, idxs in buckets.items():
+        if len(idxs) < 2:
+            continue
+        if key.startswith("k:"):
             continue
         orden = sorted(set(idxs))
         for a in range(len(orden)):
             for b in range(a + 1, len(orden)):
                 pares.add((orden[a], orden[b]))
-        if len(pares) >= MAX_PAIRS_TOTAL:
-            break
+
+    if token_sets is not None:
+        posting: Dict[str, List[int]] = defaultdict(list)
+        for i, toks in enumerate(token_sets):
+            for t in toks:
+                posting[t].append(i)
+        shared: Dict[Tuple[int, int], int] = defaultdict(int)
+        for tok, idxs in posting.items():
+            df = len(idxs)
+            if df < 2 or df > MAX_BUCKET:
+                continue
+            rare = df <= 6
+            for a in range(df):
+                ia = idxs[a]
+                for b in range(a + 1, df):
+                    key = (ia, idxs[b]) if ia < idxs[b] else (idxs[b], ia)
+                    shared[key] += 1
+                    if rare:
+                        shared[key] += 1
+        for key, cnt in shared.items():
+            if cnt >= 2:
+                pares.add(key)
+            if len(pares) >= MAX_PAIRS_TOTAL:
+                break
+
+    if unit_matrix is not None and len(unit_matrix) >= 2 and len(pares) < MAX_PAIRS_TOTAL:
+        M = unit_matrix
+        step = 512
+        for s in range(0, len(M), step):
+            block = M[s:s + step] @ M.T
+            ii, jj = np.nonzero(block >= EMBED_CANDIDATE_MIN)
+            for a, b in zip(ii.tolist(), jj.tolist()):
+                i, j = s + a, b
+                if i < j:
+                    pares.add((i, j))
+            if len(pares) >= MAX_PAIRS_TOTAL:
+                break
+
     if counter:
         counter.add(len(pares))
     return sorted(pares)
@@ -796,9 +964,25 @@ def agrupar_noticias_bloqueado(
     ctx_n = [_norm_text(c) for c in (contextos or [""] * n)]
     url_n = [normalize_url(u) for u in (urls or [""] * n)]
 
+    # Per-row precomputation: tokens are built once, not once per pair.
+    res_words = [r.split()[:MAX_CMP_WORDS] for r in res_n]
+    res_pref = [_prefix(r, 10) for r in res_n]
+    texto_row = [" ".join(x for x in (tit_n[i], res_n[i], ctx_n[i]) if x) for i in range(n)]
+    tok_conf = [_tokens_distintivos(texto_row[i], min_len=3) for i in range(n)]
+    tok_ov = [_tokens_distintivos(ctx_n[i] or texto_row[i]) for i in range(n)]
+    tok_tit = [_stems(_tokens_distintivos(tit_n[i])) for i in range(n)]
+    # Blocking tokens: headline tokens plus the first distinctive tokens of
+    # the resumen/contexto, so paraphrased headlines still meet.
+    tok_block = []
+    for i in range(n):
+        s = set(tok_tit[i])
+        extra = [t for t in (res_n[i] or ctx_n[i]).split() if len(t) >= 5 and t not in _TOKENS_DEBILES]
+        s.update(_stems(extra[:10]))
+        tok_block.append(s)
+
     buckets: Dict[str, List[int]] = defaultdict(list)
     for i in range(n):
-        tp = _prefix(tit_n[i], 8)
+        tp = _prefix(tit_n[i], 6)
         rp = _prefix(res_n[i] or ctx_n[i], 12)
         if tp:
             buckets[f"t:{tp}"].append(i)
@@ -808,31 +992,41 @@ def agrupar_noticias_bloqueado(
             buckets[f"u:{url_n[i]}"].append(i)
         if fechas is not None and horas is not None:
             fh = f"{normalizar_fecha(fechas[i])}|{normalizar_hora(horas[i])}"
-            if fh != "|":
+            if fh != "|" and not fh.endswith("|"):
                 buckets[f"d:{fh}"].append(i)
-        for tok in list(_tokens_distintivos(tit_n[i] or res_n[i] or ctx_n[i]))[:8]:
-            buckets[f"k:{tok}"].append(i)
-
-    pares = _candidate_pairs(n, buckets, counter)
 
     embs = list(embeddings) if embeddings is not None else [None] * n
     # Unit-normalize once; per-pair sklearn cosine_similarity cost ~3ms each
     # (≈30s for 9k pairs). A dot product of unit vectors is the same number.
     unit = [None] * n
+    dim = None
     for k, e in enumerate(embs):
         if e is None:
             continue
         v = np.asarray(e, dtype=float).ravel()
         nrm = np.linalg.norm(v)
-        unit[k] = v / nrm if nrm > 0 else None
+        if nrm > 0:
+            unit[k] = v / nrm
+            dim = len(v)
+    unit_matrix = None
+    if dim is not None:
+        unit_matrix = np.zeros((n, dim), dtype=float)
+        for k, u in enumerate(unit):
+            if u is not None and len(u) == dim:
+                unit_matrix[k] = u
     can_cos = True
 
-    # Per-row precomputation: tokens are built once, not once per pair.
-    res_words = [r.split()[:MAX_CMP_WORDS] for r in res_n]
-    res_pref = [_prefix(r, 10) for r in res_n]
-    texto_row = [" ".join(x for x in (tit_n[i], res_n[i], ctx_n[i]) if x) for i in range(n)]
-    tok_conf = [_tokens_distintivos(texto_row[i], min_len=3) for i in range(n)]
-    tok_ov = [_tokens_distintivos(ctx_n[i] or texto_row[i]) for i in range(n)]
+    pares = _candidate_pairs(n, buckets, counter, token_sets=tok_block, unit_matrix=unit_matrix)
+
+    def _jaccard_titulo(i: int, j: int) -> float:
+        a, b = tok_tit[i], tok_tit[j]
+        if not a or not b:
+            return 0.0
+        return len(a & b) / max(1, len(a | b))
+
+    def _contenido(i: int, j: int) -> bool:
+        a, b = tit_n[i], tit_n[j]
+        return bool(a and b and min(len(a), len(b)) >= 25 and (a in b or b in a))
 
     def _conflicto(i: int, j: int) -> bool:
         ta, tb = tok_conf[i], tok_conf[j]
@@ -860,10 +1054,17 @@ def agrupar_noticias_bloqueado(
             semantic = float(np.dot(unit[i], unit[j]))
         overlap = _overlap(i, j)
         same_url = bool(url_n[i] and url_n[i] == url_n[j])
+        jac_t = _jaccard_titulo(i, j)
+        shared_t = len(tok_tit[i] & tok_tit[j])
         mismo_hecho = (
             sim_t >= SIMILARITY_THRESHOLD_TITULOS
+            or _contenido(i, j)
+            or (jac_t >= JACCARD_TITULO_GRUPO and shared_t >= 4)
+            or (jac_t >= 0.80 and shared_t >= 3)
+            or (jac_t >= 0.50 and shared_t >= 3 and semantic >= 0.82)
             or sim_r >= SIMILARITY_THRESHOLD_RESUMEN
             or same_url
+            or semantic >= SIMILARITY_SEMANTIC_ALONE
             or (semantic >= SIMILARITY_THRESHOLD_SEMANTIC and overlap >= MIN_OVERLAP_GRUPO)
         )
         if mismo_hecho:
@@ -898,18 +1099,21 @@ def validar_subtema(etiqueta: str) -> bool:
     if not etiqueta or not str(etiqueta).strip():
         return False
     et = str(etiqueta).strip().strip(" .;:¡!¿?")
-    low = unidecode(et.lower())
+    if _es_generica(et):
+        return False
     words = _palabras(et)
     if not (MIN_PALABRAS_SUBTEMA <= len(words) <= MAX_PALABRAS_SUBTEMA):
         return False
     last = unidecode(words[-1].lower().rstrip(".,;:!?¿¡"))
     if last in _TRAILING_INCOMPLETE or last in _QUESTION_TAILS:
         return False
-    if last in _CONJUGATED_TAILS:
+    if _es_verbo_conjugado(words[-1]) or _es_verbo_conjugado(words[0]):
         return False
-    if any(unidecode(w.lower().rstrip(".,;:")) in _CONJUGATED_TAILS for w in words):
+    if any(_es_verbo_conjugado(w) for w in words):
         return False
     if any(unidecode(w.lower()) in {"como", "cómo"} for w in words):
+        return False
+    if unidecode(words[0].lower()) in _DROP_LEAD | {"que", "y", "o", "pero"}:
         return False
     head = " ".join(unidecode(w.lower()) for w in words[:2])
     if unidecode(words[0].lower()) in _CHANNEL_PREFIXES or head in _CHANNEL_PREFIXES:
@@ -918,9 +1122,12 @@ def validar_subtema(etiqueta: str) -> bool:
         return False
     nexos = [unidecode(w.lower()) for w in words[1:] if unidecode(w.lower()) in _NEXOS]
     content = [w for w in words if unidecode(w.lower()) not in _NEXOS | STOPWORDS_ES]
-    if len(content) >= 3 and not nexos:
-        return False
-    if len(words) <= 4 and not nexos:
+    if not nexos:
+        # Without a preposition only 'Noun + adjective(s)' is a phrase;
+        # anything else is a keyword collage ('Diporto resultados jornada').
+        if not all(_parece_adjetivo(w) for w in words[1:]):
+            return False
+    if len(content) >= 4 and not nexos:
         return False
     if "?" in et or "¿" in et:
         return False
@@ -928,15 +1135,33 @@ def validar_subtema(etiqueta: str) -> bool:
 
 
 def validar_tema(etiqueta: str) -> bool:
+    """Tema: coherent thematic noun phrase, 2–5 words, no verbs, no
+    question tails, no bare keyword pair ('Agenda tendrá', 'Balance seguridad')."""
     if not etiqueta or not str(etiqueta).strip():
         return False
-    words = _palabras(str(etiqueta))
-    if not (2 <= len(words) <= 6):
+    et = str(etiqueta).strip()
+    if "?" in et or "¿" in et or "|" in et or _es_generica(et):
+        return False
+    words = _palabras(et)
+    if not (2 <= len(words) <= MAX_PALABRAS_TEMA):
         return False
     last = unidecode(words[-1].lower().rstrip(".,;:!?¿¡"))
-    if last in _TRAILING_INCOMPLETE or last in _CONJUGATED_TAILS or last in _QUESTION_TAILS:
+    if last in _TRAILING_INCOMPLETE or last in _QUESTION_TAILS:
         return False
-    if any(unidecode(w.lower()) in _CONJUGATED_TAILS for w in words):
+    if any(_es_verbo_conjugado(w) for w in words):
+        return False
+    if unidecode(words[0].lower()) in _CHANNEL_PREFIXES | _DROP_LEAD:
+        return False
+    content = [w for w in words if unidecode(w.lower()) not in _NEXOS | STOPWORDS_ES | {"y", "e"}]
+    nexos = [w for w in words if unidecode(w.lower()) in _NEXOS | {"y", "e"}]
+    # Two bare content words glued together ("Balance seguridad") is a
+    # keyword collage unless the second is an adjective-like modifier.
+    if not nexos and len(words) >= 2:
+        # Noun + adjective(s) is fine ('Seguridad ciudadana', 'Gestión
+        # pública local'); noun + noun is a collage ('Balance seguridad').
+        if not all(_parece_adjetivo(w) for w in words[1:]):
+            return False
+    if len(content) >= 4 and not nexos:
         return False
     return True
 
@@ -944,8 +1169,22 @@ def validar_tema(etiqueta: str) -> bool:
 def _capitalizar(frase: str) -> str:
     frase = re.sub(r"\s+", " ", (frase or "").strip())
     if not frase:
-        return "Cobertura informativa general"
+        return ""
     return frase[0].upper() + frase[1:]
+
+
+_ETIQUETAS_GENERICAS = {
+    "cobertura informativa general", "cobertura informativa", "informacion general",
+    "actualidad", "noticias", "varios", "sin tema", "otros", "general", "cobertura",
+    "actualidad general", "noticias generales", "informacion", "tema general",
+    "cobertura de informacion relevante", "cobertura de la noticia", "hecho noticioso",
+    "noticia sobre la marca", "mencion de la marca", "actividad corporativa",
+    "gestion corporativa", "gestion institucional",
+}
+
+
+def _es_generica(etiqueta: str) -> bool:
+    return _norm_text(etiqueta) in _ETIQUETAS_GENERICAS
 
 
 _VERBOS_TITULAR = re.compile(
@@ -980,19 +1219,25 @@ def _objeto_tras_verbo(titulo: str) -> str:
     limpio = _limpiar_titular(titulo)
     if not limpio:
         return ""
+    tokens = limpio.split()
     plano = unidecode(limpio.lower())
+    verbo_pos = None
     m = _VERBOS_TITULAR.search(plano)
-    if not m:
+    if m:
+        verbo_pos = len(plano[: m.start()].split())
+    else:
+        for k, tok in enumerate(tokens):
+            if _es_verbo_conjugado(tok):
+                verbo_pos = k
+                break
+    if verbo_pos is None or verbo_pos >= len(tokens) - 1:
         return ""
-    # Map match offset back to the original (unidecode keeps 1:1 length for these chars).
-    resto = limpio[m.end():].strip(" ,.:;")
+    resto = " ".join(tokens[verbo_pos + 1:]).strip(" ,.:;")
     resto = re.split(r"[\.\?\!¿¡]|\s[-–—]\s|:\s", resto)[0].strip()
     words = resto.split()
     while words and unidecode(words[0].lower()) in _DROP_LEAD | {"que", "a", "al", "el", "la", "los", "las", "un", "una", "unos", "unas", "su", "sus"}:
         words.pop(0)
-    words = words[:MAX_PALABRAS_SUBTEMA]
-    while words and unidecode(words[-1].lower().rstrip(".,;:")) in _TRAILING_INCOMPLETE | _QUESTION_TAILS | _DROP_LEAD:
-        words.pop()
+    words = _recortar_sintagma(words, MAX_PALABRAS_SUBTEMA)
     frase = _capitalizar(" ".join(words))
     return frase if validar_subtema(frase) else ""
 
@@ -1006,26 +1251,36 @@ def fallback_subtema(contexto: str, titulo: str = "") -> str:
     norm = _norm_text(texto)
     sent = re.split(r"(?<=[\.\!\?])\s+", texto.strip())[0] if texto.strip() else ""
 
+    # 1) Object of the headline verb: 'Alcalde presenta balance de seguridad
+    #    en Cali' → 'Balance de seguridad en Cali'.
     desde_titular = _objeto_tras_verbo(titulo) or _objeto_tras_verbo(sent)
     if desde_titular:
         return desde_titular
 
+    # 2) A verb-less headline is already a noun phrase ('Balance de víctimas
+    #    del terremoto en el Valle'): use it, trimmed at a phrase boundary.
+    limpio = _limpiar_titular(titulo)
+    if limpio:
+        cand_words = re.split(r"[\.\?\!¿¡]|\s[-–—]\s|:\s", limpio)[0].split()
+        while cand_words and unidecode(cand_words[0].lower()) in _DROP_LEAD | {"el", "la", "los", "las", "un", "una"}:
+            cand_words.pop(0)
+        cand = _capitalizar(" ".join(_recortar_sintagma(cand_words, MAX_PALABRAS_SUBTEMA)))
+        if cand and validar_subtema(cand) and not any(_es_verbo_conjugado(w) for w in cand.split()):
+            return cand
+
+    # 3) Generic topical patterns (no brand- or client-specific rules).
     if re.search(r"\b(terremoto|sismo|temblor)\b", norm) and re.search(
-        r"\b(victima|victimas|muerto|muertos|herido|heridos|asciend)", norm
+        r"\b(victima|victimas|muerto|muertos|herido|heridos|asciend|fallecid)", norm
     ):
         return "Balance de víctimas del terremoto"
     if re.search(r"\b(sismo|terremoto|temblor)\b", norm) and re.search(
-        r"\b(cali|recomend|saber|prepar|simulacro)\b", norm
+        r"\b(recomend|saber|prepar|simulacro|que hacer)\b", norm
     ):
-        return "Recomendaciones ante sismos en Cali"
+        return "Recomendaciones ante sismos"
     if re.search(r"\b(terremoto|sismo|temblor)\b", norm):
         return "Cobertura del sismo en Colombia"
-    if re.search(r"\b(rescate|solidaridad|topos)\b", norm):
-        return "Solidaridad en labores de rescate"
-    if re.search(r"\bdiporto\b", norm):
-        if re.search(r"\b(jornada|resultado|resultados|fecha)\b", norm):
-            return "Resultados de la jornada deportiva"
-        return "Cobertura deportiva de Diporto"
+    if re.search(r"\b(jornada|fecha)\b", norm) and re.search(r"\b(resultado|resultados|liga|torneo|partido)\b", norm):
+        return "Resultados de la jornada deportiva"
 
     # Noun-phrase from the headline (or first sentence): drop channel
     # prefixes, verbs and filler leads before composing "X de Y".
@@ -1058,34 +1313,174 @@ def fallback_subtema(contexto: str, titulo: str = "") -> str:
     return "Cobertura de información relevante"
 
 
-def fallback_tema(subtema: str, contexto: str = "") -> str:
-    norm = _norm_text(f"{subtema} {contexto}")
-    if re.search(r"\b(terremoto|sismo|temblor)\b", norm):
-        return "Sismos y emergencias"
-    if re.search(r"\b(rescate|solidaridad)\b", norm):
-        return "Emergencias y solidaridad"
-    if re.search(r"\bdiporto\b", norm) or re.search(r"\bdeporte", norm):
-        return "Actualidad deportiva"
-    words = [w for w in _palabras(subtema) if unidecode(w.lower()) not in _NEXOS | STOPWORDS_ES]
-    if len(words) >= 2:
-        return _capitalizar(f"{words[0]} {words[1]}")
-    if words:
-        return _capitalizar(f"Asuntos de {words[0].lower()}")
-    return "Cobertura informativa"
+TAXONOMIA_TEMAS: Dict[str, Tuple[str, ...]] = {
+    "Emergencias y desastres naturales": (
+        "sismo", "terremoto", "temblor", "inundacion", "deslizamiento", "avalancha",
+        "incendio", "emergencia", "damnificado", "rescate", "bombero", "huracan",
+        "lluvia", "ola invernal", "creciente", "evacuacion", "tragedia", "victima",
+        "simulacro", "alerta roja", "socorro", "topos",
+    ),
+    "Seguridad y orden público": (
+        "homicidio", "seguridad", "policia", "captura", "robo", "hurto", "atentado",
+        "violencia", "extorsion", "delincuencia", "disidencia", "ejercito", "secuestro",
+        "masacre", "asesinato", "sicario", "banda", "criminal", "explosivo", "fleteo",
+        "riña", "rina", "microtrafico", "narcotrafico", "orden publico",
+    ),
+    "Salud pública": (
+        "salud", "hospital", "eps", "medicamento", "vacuna", "paciente", "enfermedad",
+        "clinica", "epidemia", "dengue", "medico", "urgencias", "brote", "sanitario",
+        "cancer", "covid", "mental", "ambulancia",
+    ),
+    "Educación y formación": (
+        "educacion", "colegio", "universidad", "estudiante", "docente", "icfes",
+        "matricula", "beca", "profesor", "escolar", "academico", "rector", "pae",
+        "campus", "graduacion", "investigacion cientifica",
+    ),
+    "Economía y empresas": (
+        "economia", "inflacion", "empresa", "inversion", "dolar", "precio", "comercio",
+        "exportacion", "impuesto", "tributaria", "banco", "credito", "pib", "mercado",
+        "negocio", "ventas", "consumo", "industria", "emprendimiento", "financiero",
+        "bolsa", "arancel", "importacion", "ganancia", "utilidades", "cifras economicas",
+    ),
+    "Empleo y trabajo": (
+        "empleo", "trabajador", "sindicato", "salario", "desempleo", "paro", "huelga",
+        "laboral", "contratacion", "despido", "jornada laboral", "pension",
+    ),
+    "Infraestructura y movilidad": (
+        "via", "vias", "carretera", "movilidad", "transporte", "obra", "puente",
+        "aeropuerto", "metro", "transmilenio", "mio", "trafico", "trancon", "peaje",
+        "infraestructura", "pavimento", "ciclorruta", "semaforo", "tunel", "autopista",
+        "terminal", "vial", "malla viaria", "hueco",
+    ),
+    "Política y gobierno": (
+        "alcalde", "alcaldia", "gobernador", "gobernacion", "congreso", "senado",
+        "presidente", "eleccion", "gobierno", "ministro", "ministerio", "decreto",
+        "reforma", "concejo", "asamblea", "candidato", "partido politico", "campaña",
+        "campana", "plan de desarrollo", "consejo de ministros", "politica",
+        "gabinete", "posesion", "renuncia", "nombramiento", "agenda",
+    ),
+    "Justicia y procesos judiciales": (
+        "fiscalia", "juez", "procuraduria", "contraloria", "condena", "demanda",
+        "tutela", "corte suprema", "corte constitucional", "alta corte", "consejo de estado",
+        "tribunal", "investigacion", "sancion", "imputacion",
+        "audiencia", "carcel", "sentencia", "juicio", "abogado", "delito",
+    ),
+    "Actualidad deportiva": (
+        "futbol", "liga", "partido", "jornada", "seleccion", "torneo", "atleta",
+        "ciclismo", "deportivo", "campeonato", "gol", "estadio", "tecnico", "jugador",
+        "america de cali", "deportivo cali", "diporto", "clasico", "medalla", "maraton",
+        "deporte", "olimpico", "baloncesto", "tenis",
+    ),
+    "Cultura y entretenimiento": (
+        "festival", "concierto", "feria", "cultura", "musica", "cine", "arte",
+        "artista", "teatro", "salsa", "exposicion", "libro", "literatura", "danza",
+        "petronio", "carnaval", "premio cultural", "museo", "cantante",
+    ),
+    "Medio ambiente": (
+        "ambiente", "ambiental", "contaminacion", "deforestacion", "rio", "fauna",
+        "clima", "reciclaje", "agua", "cambio climatico", "humedal", "bosque",
+        "biodiversidad", "residuos", "basuras", "arbol", "mineria ilegal", "emisiones",
+    ),
+    "Servicios públicos": (
+        "energia", "acueducto", "alcantarillado", "tarifa", "luz", "gas", "internet",
+        "emcali", "epm", "corte de agua", "cortes de agua", "corte del servicio",
+        "suspension del servicio", "racionamiento", "apagon", "factura",
+        "servicio publico", "servicios publicos", "aseo", "recoleccion de basuras",
+    ),
+    "Responsabilidad social y solidaridad": (
+        "solidaridad", "donacion", "voluntario", "fundacion", "ayuda humanitaria",
+        "comunidad", "beneficiario", "vulnerable", "social", "jornada de salud",
+        "brigada", "campaña solidaria", "entrega de ayudas",
+    ),
+    "Tecnología e innovación": (
+        "tecnologia", "digital", "inteligencia artificial", "innovacion", "app",
+        "ciberseguridad", "software", "plataforma", "startup", "datos", "conectividad",
+    ),
+    "Turismo y destinos": (
+        "turismo", "turista", "hotel", "destino", "temporada", "visitante", "viajero",
+    ),
+    "Vivienda y ordenamiento territorial": (
+        "vivienda", "pot", "urbanismo", "predio", "arriendo", "construccion de vivienda",
+        "barrio", "invasion", "titulacion", "subsidio de vivienda",
+    ),
+}
+
+TEMA_POR_DEFECTO = "Actualidad institucional"
+
+
+def tema_por_taxonomia(subtema: str, contexto: str = "", titulo: str = "") -> str:
+    """Deterministic tema: best-matching thematic category by keyword hits
+    on subtema (weight 3), título (2) and contexto (1). Never a collage."""
+    campos = (
+        (_norm_text(subtema), 3),
+        (_norm_text(titulo), 2),
+        (_norm_text(contexto)[:1200], 1),
+    )
+    puntajes: Dict[str, float] = defaultdict(float)
+    for tema, claves in TAXONOMIA_TEMAS.items():
+        for texto, peso in campos:
+            if not texto:
+                continue
+            padded = f" {texto} "
+            for k in claves:
+                if f" {k}" in padded:
+                    # Stem-tolerant: 'via' matches 'vias', 'victima' 'victimas'.
+                    # Multi-word keys are more specific and break ties.
+                    puntajes[tema] += peso * (2 if " " in k else 1)
+    if not puntajes:
+        return ""
+    mejor = max(puntajes.items(), key=lambda kv: kv[1])
+    return mejor[0] if mejor[1] >= 2 else ""
+
+
+def fallback_tema(subtema: str, contexto: str = "", titulo: str = "") -> str:
+    tema = tema_por_taxonomia(subtema, contexto, titulo)
+    if tema and validar_tema(tema):
+        return tema
+    return TEMA_POR_DEFECTO
+
+
+def _recortar_sintagma(words: List[str], max_palabras: int) -> List[str]:
+    """Cut a long noun phrase at a phrase boundary, never mid-complement.
+
+    'Solidaridad de los caleños durante las labores de rescate humanitario
+    en Cali' → stops before the last preposition that would be left
+    dangling, so the result is still a complete phrase.
+    """
+    if len(words) <= max_palabras:
+        out = list(words)
+    else:
+        adjuntos = {"en", "durante", "tras", "ante", "contra", "con", "para", "por",
+                    "sobre", "hacia", "desde", "hasta", "y", "e", "segun", "según"}
+        complementos = {"de", "del"}
+        corte = None
+        # Prefer dropping a whole adjunct ('… durante las labores …', '… en Cali')
+        # over splitting a 'de' complement ('labores de rescate').
+        for k in range(min(max_palabras, len(words) - 1), 2, -1):
+            if unidecode(words[k].lower()) in adjuntos:
+                corte = k
+                break
+        if corte is None:
+            for k in range(min(max_palabras, len(words) - 1), 2, -1):
+                if unidecode(words[k].lower()) in complementos:
+                    corte = k
+                    break
+        out = words[:corte] if corte and corte >= 3 else words[:max_palabras]
+    while out and unidecode(out[-1].lower().rstrip(".,;:")) in _TRAILING_INCOMPLETE | _QUESTION_TAILS | _DROP_LEAD | {"durante", "tras", "ante", "contra", "y", "e"}:
+        out.pop()
+    return out
 
 
 def etiquetar_gramatical(contexto: str, titulo: str = "",
                          chat_fn: Optional[Callable] = None) -> Tuple[str, str]:
     sub = fallback_subtema(contexto, titulo)
-    tema = fallback_tema(sub, contexto)
+    tema = fallback_tema(sub, contexto, titulo)
     if validar_subtema(sub) and validar_tema(tema):
         return tema, sub
-    if chat_fn is None:
-        return (
-            tema if validar_tema(tema) else "Cobertura informativa",
-            sub if validar_subtema(sub) else "Cobertura de información relevante",
-        )
-    return tema, sub
+    return (
+        tema if validar_tema(tema) else TEMA_POR_DEFECTO,
+        sub if validar_subtema(sub) else "Cobertura de información relevante",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1132,51 +1527,100 @@ def clasificar_lotes(
         tema, sub = etiquetar_gramatical(ctx, titulo, chat_fn=None)
         results[i]["tema"] = tema
         results[i]["subtema"] = sub
-        # Tone heuristic is weak; if chat is available we still batch tone+repair.
-        if chat_fn is not None and (not validar_subtema(sub) or True):
-            # Always send to batch when chat_fn exists so tone is model-based,
-            # but reuse heuristic labels if the model fails.
-            pending.append(i)
         results[i]["tono"] = it.get("tono") or "Neutro"
+        if chat_fn is not None:
+            # Every representative goes to the batch: tone is model-based and
+            # the model's labels replace the heuristic ones when they validate.
+            pending.append(i)
 
     if chat_fn is None or not pending:
         return results
 
     aliases_str = ", ".join(_lista_alias(marca, aliases)[1:6])
+    temas_sugeridos = " | ".join(TAXONOMIA_TEMAS.keys())
+    # Model-side only: an ungrammatical fragment reaches the sheet only if
+    # both the model and the deterministic fallback fail the validator.
+    rejected: Dict[int, List[str]] = defaultdict(list)
 
-    def _run_batch(chunk_idx: List[int]) -> None:
+    def _prompt(payload: List[Dict[str, Any]], reparacion: bool) -> str:
+        cabecera = (
+            f"Eres un analista senior de medios en Colombia. Marca analizada: '{marca}'"
+            + (f" (alias: {aliases_str})" if aliases_str else "")
+            + ".\nPara cada ítem analiza ÚNICAMENTE el campo 'contexto' (es el Contexto analizado: "
+            "párrafo con la mención de la marca; si no la menciona, es el resumen o el título).\n"
+        )
+        formato = (
+            "Devuelve SOLO JSON: {\"items\":[{\"id\":0,\"tono\":\"Positivo|Negativo|Neutro\","
+            "\"tema\":\"...\",\"subtema\":\"...\"}]}\n"
+        )
+        reglas = (
+            "SUBTEMA (hecho concreto, 4-9 palabras): frase nominal COMPLETA y coherente en español "
+            "de Colombia que describa el hecho específico de la noticia. Debe tener núcleo "
+            "sustantivo + complemento con preposición (de/del/en/para/sobre/ante/por). "
+            "Tildes correctas. PROHIBIDO: unir palabras clave sueltas ('Diporto resultados jornada'), "
+            "verbos conjugados ('ascienden', 'tendrá', 'anunció'), colas interrogativas ('cómo saber si'), "
+            "prefijos de canal ('Video', 'En vivo'), copiar o recortar el titular, terminar en "
+            "preposición o artículo, frases genéricas ('Cobertura informativa').\n"
+            "  Correcto: 'Balance de víctimas del terremoto en el suroccidente', "
+            "'Recomendaciones ante sismos para viviendas en Cali', "
+            "'Inversión en vías terciarias del Cauca'.\n"
+            "  Incorrecto: 'Terremoto en colombia ascienden', 'Sismo en cali cómo saber si', "
+            "'Agenda tendrá', 'Balance seguridad'.\n"
+            "TEMA (ámbito, 2-5 palabras): categoría temática nominal, más general que el subtema, "
+            "sin verbos ni nombres propios. Usa preferiblemente una de estas o una equivalente: "
+            f"{temas_sugeridos}.\n"
+            "TONO: impacto reputacional DIRECTO sobre la marca (no el tono general de la noticia). "
+            "Positivo si la marca logra, gana, aporta, es reconocida; Negativo si es cuestionada, "
+            "sancionada, afectada o responsable de un daño; Neutro si solo se menciona o el hecho "
+            "no cambia su imagen.\n"
+        )
+        extra = ""
+        if reparacion:
+            extra = (
+                "REPARACIÓN: estas etiquetas fueron RECHAZADAS por incompletas, cortadas o "
+                "por ser una unión de palabras clave. Redacta de nuevo tema y subtema como frases "
+                "nominales completas basadas en el contexto; el campo 'rechazadas' muestra lo que NO debes repetir.\n"
+            )
+        return cabecera + formato + reglas + extra + f"ÍTEMS:\n{json.dumps(payload, ensure_ascii=False)}"
+
+    def _aplicar(i: int, row: Dict[str, Any]) -> Tuple[bool, bool]:
+        it = items[i]
+        tono = str(row.get("tono") or results[i]["tono"]).strip().title()
+        if tono not in ("Positivo", "Negativo", "Neutro"):
+            tono = results[i]["tono"] if results[i]["tono"] in ("Positivo", "Negativo", "Neutro") else "Neutro"
+        tema = _capitalizar(str(row.get("tema") or "").strip().strip('"\'.'))
+        sub = _capitalizar(str(row.get("subtema") or "").strip().strip('"\'.'))
+        ok_sub = validar_subtema(sub)
+        ok_tema = validar_tema(tema)
+        if not ok_sub and sub:
+            rejected[i].append(sub)
+        if not ok_tema and tema:
+            rejected[i].append(tema)
+        results[i]["tono"] = tono
+        if ok_sub:
+            results[i]["subtema"] = sub
+        if ok_tema:
+            results[i]["tema"] = tema
+        return ok_sub, ok_tema
+
+    def _run_batch(chunk_idx: List[int], reparacion: bool = False) -> List[int]:
         payload = []
         for i in chunk_idx:
             it = items[i]
-            payload.append({
+            entry = {
                 "id": i,
-                "contexto": str(it.get("contexto") or "")[:900],
-                "titulo_interno": normalize_title_for_comparison(it.get("titulo") or "")[:180],
-            })
-        prompt = (
-            f"Eres analista de reputación en Colombia. Marca: '{marca}'"
-            + (f" (alias: {aliases_str})" if aliases_str else "")
-            + ".\nAnaliza SOLO el campo 'contexto' de cada ítem (Contexto analizado).\n"
-            "Devuelve JSON: {\"items\":[{\"id\":0,\"tono\":\"Positivo|Negativo|Neutro\","
-            "\"tema\":\"frase nominal general 2-5 palabras\","
-            "\"subtema\":\"frase nominal específica 3-7 palabras\"}]}\n"
-            "REGLAS DE SUBTEMA: frase nominal completa en español colombiano, "
-            "con preposición (de/del/en/para/sobre), 3-7 palabras. "
-            "PROHIBIDO: colages de keywords, colas interrogativas ('cómo saber si'), "
-            "verbos conjugados sueltos ('ascienden'), prefijos de canal ('Video'), "
-            "copiar el titular, fragmentar el título.\n"
-            "Ejemplos correctos: 'Balance de víctimas del terremoto', "
-            "'Recomendaciones ante sismos en Cali'.\n"
-            "TEMA más general que el subtema, coherente.\n"
-            "TONO = impacto reputacional DIRECTO sobre la marca, no el tono general.\n"
-            f"ÍTEMS:\n{json.dumps(payload, ensure_ascii=False)}"
-        )
+                "contexto": str(it.get("contexto") or "")[:1100],
+            }
+            if reparacion:
+                entry["rechazadas"] = rejected.get(i, [])[:4]
+            payload.append(entry)
         if call_counter:
             with _COUNTER_LOCK:
                 call_counter.chat += 1
                 call_counter.chat_items += len(chunk_idx)
+        fallidos: List[int] = []
         try:
-            raw = chat_fn(prompt)
+            raw = chat_fn(_prompt(payload, reparacion))
             data = _parse_chat_payload(raw)
             rows = data.get("items") or data.get("resultados") or []
             by_id = {}
@@ -1186,39 +1630,77 @@ def clasificar_lotes(
                 except Exception:
                     continue
             for i in chunk_idx:
-                row = by_id.get(i, {})
-                tono = str(row.get("tono") or results[i]["tono"]).strip().title()
-                if tono not in ("Positivo", "Negativo", "Neutro"):
-                    tono = "Neutro"
-                tema = str(row.get("tema") or results[i]["tema"]).strip()
-                sub = str(row.get("subtema") or results[i]["subtema"]).strip()
-                if not validar_subtema(sub):
-                    sub = fallback_subtema(items[i].get("contexto", ""), items[i].get("titulo", ""))
-                if not validar_tema(tema):
-                    tema = fallback_tema(sub, items[i].get("contexto", ""))
-                results[i] = {"tono": tono, "tema": _capitalizar(tema), "subtema": _capitalizar(sub)}
+                ok_sub, ok_tema = _aplicar(i, by_id.get(i, {}))
+                if not (ok_sub and ok_tema):
+                    fallidos.append(i)
         except Exception:
-            for i in chunk_idx:
-                if not validar_subtema(results[i]["subtema"]):
-                    results[i]["subtema"] = fallback_subtema(
-                        items[i].get("contexto", ""), items[i].get("titulo", "")
-                    )
-                if not validar_tema(results[i]["tema"]):
-                    results[i]["tema"] = fallback_tema(
-                        results[i]["subtema"], items[i].get("contexto", "")
-                    )
+            fallidos.extend(chunk_idx)
+        return fallidos
 
-    chunks = [pending[s:s + batch_size] for s in range(0, len(pending), batch_size)]
-    workers = max(1, min(CHAT_PARALLEL_BATCHES, len(chunks)))
-    if workers == 1:
-        for ch in chunks:
-            _run_batch(ch)
-    else:
-        # Bounded concurrency: a handful of batches in flight, never one
-        # request per news item and never an unbounded retry storm.
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            list(ex.map(_run_batch, chunks))
+    def _run_all(idx_list: List[int], reparacion: bool) -> List[int]:
+        chunks = [idx_list[s:s + batch_size] for s in range(0, len(idx_list), batch_size)]
+        if not chunks:
+            return []
+        workers = max(1, min(CHAT_PARALLEL_BATCHES, len(chunks)))
+        fallidos: List[int] = []
+        if workers == 1:
+            for ch in chunks:
+                fallidos.extend(_run_batch(ch, reparacion))
+        else:
+            # Bounded concurrency: a handful of batches in flight, never one
+            # request per news item and never an unbounded retry storm.
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                for res in ex.map(lambda ch: _run_batch(ch, reparacion), chunks):
+                    fallidos.extend(res)
+        return fallidos
+
+    fallidos = _run_all(pending, reparacion=False)
+    # One bounded repair round, still batched, only for rejected labels.
+    if fallidos:
+        fallidos = _run_all(sorted(set(fallidos)), reparacion=True)
+    for i in range(len(items)):
+        if not validar_subtema(results[i]["subtema"]):
+            results[i]["subtema"] = fallback_subtema(items[i].get("contexto", ""), items[i].get("titulo", ""))
+        if not validar_tema(results[i]["tema"]):
+            results[i]["tema"] = fallback_tema(results[i]["subtema"], items[i].get("contexto", ""), items[i].get("titulo", ""))
+        results[i]["tema"] = _capitalizar(results[i]["tema"])
+        results[i]["subtema"] = _capitalizar(results[i]["subtema"])
     return results
+
+
+def consolidar_temas_lote(labels: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Batch-level coherence: near-identical temas collapse to the most
+    frequent spelling, and an identical subtema always maps to one tema."""
+    if not labels:
+        return labels
+    temas = [str(l.get("tema") or "") for l in labels]
+    freq = Counter(t for t in temas if t)
+    norm = {t: _norm_text(t) for t in freq}
+    canon: Dict[str, str] = {}
+    ordenados = sorted(freq, key=lambda t: (-freq[t], len(t)))
+    for t in ordenados:
+        if t in canon:
+            continue
+        canon[t] = t
+        for u in ordenados:
+            if u in canon or u == t:
+                continue
+            a, b = norm[t], norm[u]
+            if a == b or _ratio(a, b) >= 0.86 or (_stems(a.split()) == _stems(b.split())):
+                canon[u] = t
+    for l in labels:
+        if l.get("tema"):
+            l["tema"] = canon.get(l["tema"], l["tema"])
+    por_sub: Dict[str, Counter] = defaultdict(Counter)
+    for l in labels:
+        s = _norm_text(l.get("subtema") or "")
+        if s and l.get("tema"):
+            por_sub[s][l["tema"]] += 1
+    for l in labels:
+        s = _norm_text(l.get("subtema") or "")
+        if s and por_sub.get(s):
+            l["tema"] = por_sub[s].most_common(1)[0][0]
+    return labels
 
 
 # ---------------------------------------------------------------------------
@@ -1303,11 +1785,22 @@ def process_pipeline(
 
     grupos = agrupar_noticias_bloqueado(
         titulos, resumenes, contextos, embeddings,
-        urls=[url_de_celda_link(r.get(km["link_nota"])) for r in out],
+        urls=[url_de_celda_link(r.get(km["link_nota"])) or url_de_celda_link(r.get(km["link_streaming"])) for r in out],
         fechas=[r.get(km["fecha"]) for r in out],
         horas=[r.get(km["hora"]) for r in out],
         counter=progress.comparisons,
     )
+    # A duplicate always belongs to its original's group, and rows sharing
+    # the same streaming link / Link Nota are the same publication.
+    dsu2 = DSU(len(out))
+    for idxs in grupos.values():
+        for j in idxs[1:]:
+            dsu2.union(idxs[0], j)
+    for i, r in enumerate(out):
+        o = r.get("_dup_of_index")
+        if isinstance(o, int) and 0 <= o < len(out):
+            dsu2.union(i, o)
+    grupos = dsu2.grupos(len(out))
     gids = ids_grupo(grupos)
     for i, r in enumerate(out):
         r["Grupo noticia"] = gids[i]
@@ -1350,12 +1843,13 @@ def process_pipeline(
         except Exception:
             pass
 
+    labels = consolidar_temas_lote(labels)
     by_gid = {gid: labels[k] for k, gid in enumerate(gid_of_rep)}
     progress.stage("Tono", f"{progress.calls.chat} llamadas chat")
     progress.stage("Tema/Subtema", f"{len(grupos)} grupos cacheados")
 
     for gid, idxs in grupos.items():
-        lab = by_gid.get(gid) or {"tono": "Neutro", "tema": "Cobertura informativa",
+        lab = by_gid.get(gid) or {"tono": "Neutro", "tema": TEMA_POR_DEFECTO,
                                   "subtema": "Cobertura de información relevante"}
         for i in idxs:
             if out[i].get("is_duplicate"):
