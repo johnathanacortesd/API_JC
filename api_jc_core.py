@@ -948,6 +948,55 @@ def _capitalizar(frase: str) -> str:
     return frase[0].upper() + frase[1:]
 
 
+_VERBOS_TITULAR = re.compile(
+    r"\b(presenta|presentan|presento|anuncia|anuncian|anuncio|destaca|destacan|"
+    r"confirma|confirman|confirmo|pide|piden|pidio|lanza|lanzan|lanzo|abre|abren|abrio|"
+    r"inaugura|inauguran|inauguro|entrega|entregan|entrego|reporta|reportan|reporto|"
+    r"advierte|advierten|advirtio|revela|revelan|revelo|asegura|aseguran|aseguro|"
+    r"afirma|afirman|afirmo|alerta|alertan|alerto|denuncia|denuncian|denuncio|"
+    r"rechaza|rechazan|rechazo|aprueba|aprueban|aprobo|firma|firman|firmo|"
+    r"recibe|reciben|recibio|celebra|celebran|celebro|invierte|invierten|invirtio|"
+    r"impulsa|impulsan|impulso|lidera|lideran|lidero|logra|logran|logro|"
+    r"busca|buscan|busco|explica|explican|explico|analiza|analizan|analizo|"
+    r"promueve|promueven|promovio|realiza|realizan|realizo|ofrece|ofrecen|ofrecio|"
+    r"suspende|suspenden|suspendio|cierra|cierran|cerro|activa|activan|activo|"
+    r"refuerza|refuerzan|reforzo|amplia|amplian|amplio|reduce|reducen|redujo)\b"
+)
+
+_DROP_LEAD = {"otro", "otra", "otros", "otras", "este", "esta", "estos", "estas",
+              "nuevo", "nueva", "nuevos", "nuevas", "asi", "hoy", "ayer", "ahora"}
+
+
+def _limpiar_titular(titulo: str) -> str:
+    t = re.sub(r"<[^>]+>", " ", str(titulo or ""))
+    t = re.sub(r"^\s*(video|en vivo|audio|streaming|podcast|galeria|galería|fotos?)\s*[\|:\-–—]\s*",
+               "", t, flags=re.I)
+    t = t.split("|")[-1] if "|" in t else t
+    return re.sub(r"\s+", " ", t).strip(" .:;-–—")
+
+
+def _objeto_tras_verbo(titulo: str) -> str:
+    """'Alcalde presenta balance de seguridad en Cali' → 'Balance de seguridad en Cali'."""
+    limpio = _limpiar_titular(titulo)
+    if not limpio:
+        return ""
+    plano = unidecode(limpio.lower())
+    m = _VERBOS_TITULAR.search(plano)
+    if not m:
+        return ""
+    # Map match offset back to the original (unidecode keeps 1:1 length for these chars).
+    resto = limpio[m.end():].strip(" ,.:;")
+    resto = re.split(r"[\.\?\!¿¡]|\s[-–—]\s|:\s", resto)[0].strip()
+    words = resto.split()
+    while words and unidecode(words[0].lower()) in _DROP_LEAD | {"que", "a", "al", "el", "la", "los", "las", "un", "una", "unos", "unas", "su", "sus"}:
+        words.pop(0)
+    words = words[:MAX_PALABRAS_SUBTEMA]
+    while words and unidecode(words[-1].lower().rstrip(".,;:")) in _TRAILING_INCOMPLETE | _QUESTION_TAILS | _DROP_LEAD:
+        words.pop()
+    frase = _capitalizar(" ".join(words))
+    return frase if validar_subtema(frase) else ""
+
+
 def fallback_subtema(contexto: str, titulo: str = "") -> str:
     """
     Deterministic grammatical noun phrase from a parsed sentence.
@@ -956,7 +1005,10 @@ def fallback_subtema(contexto: str, titulo: str = "") -> str:
     texto = " ".join(x for x in (contexto, titulo) if x).strip()
     norm = _norm_text(texto)
     sent = re.split(r"(?<=[\.\!\?])\s+", texto.strip())[0] if texto.strip() else ""
-    sent_l = unidecode(sent.lower())
+
+    desde_titular = _objeto_tras_verbo(titulo) or _objeto_tras_verbo(sent)
+    if desde_titular:
+        return desde_titular
 
     if re.search(r"\b(terremoto|sismo|temblor)\b", norm) and re.search(
         r"\b(victima|victimas|muerto|muertos|herido|heridos|asciend)", norm
@@ -975,11 +1027,11 @@ def fallback_subtema(contexto: str, titulo: str = "") -> str:
             return "Resultados de la jornada deportiva"
         return "Cobertura deportiva de Diporto"
 
-    # Noun-phrase from first sentence: drop channel prefixes and verbs.
-    raw = re.sub(r"^(video|en vivo|audio|streaming)\s*[\|:\-–—]\s*", "", sent, flags=re.I)
-    raw = re.sub(r"<[^>]+>", "", raw)
+    # Noun-phrase from the headline (or first sentence): drop channel
+    # prefixes, verbs and filler leads before composing "X de Y".
+    raw = _limpiar_titular(titulo) or _limpiar_titular(sent)
     toks = [t for t in re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]+", raw) if t]
-    drop = STOPWORDS_ES | _CHANNEL_PREFIXES | _CONJUGATED_TAILS | _QUESTION_TAILS
+    drop = STOPWORDS_ES | _CHANNEL_PREFIXES | _CONJUGATED_TAILS | _QUESTION_TAILS | _DROP_LEAD
     kept = []
     for t in toks:
         tl = unidecode(t.lower())
