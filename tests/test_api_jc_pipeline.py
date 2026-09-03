@@ -136,25 +136,51 @@ class TestDuplicatesVsGrupo(unittest.TestCase):
         self.assertTrue(cell.hyperlink)
         self.assertIn("elpais.com.co/nota/abc", cell.hyperlink.target.lower())
 
-    def test_05_radio_tv_same_datetime_duplicate_different_not(self):
+    def test_05_radio_tv_same_mencion_medio_hora_duplicate(self):
         title_a = "Alcalde presenta balance de seguridad en Cali"
-        title_b = "Alcalde presenta balance de seguridad en Cali esta noche"
+        title_b = "Titular completamente distinto sobre otro asunto"
         rows = [
             _row(id="30", tipo="Radio", medio="Caracol Radio", fecha="2026-03-01",
                  hora="07:00", titulo=title_a, link=None),
-            _row(id="31", tipo="Televisión", medio="Telepacífico", fecha="2026-03-01",
+            # same mención + same medio + same hora, different title → duplicate
+            _row(id="31", tipo="Radio", medio="Caracol Radio", fecha="2026-03-01",
                  hora="07:00", titulo=title_b, link=None),
-            _row(id="32", tipo="Radio", medio="RCN Radio", fecha="2026-03-01",
-                 hora="09:30", titulo=title_a, link=None),
-            _row(id="33", tipo="Radio", medio="Caracol Radio", fecha="2026-03-02",
+            # same title, same hora, different medio → NOT duplicate (Grupo only)
+            _row(id="32", tipo="Televisión", medio="Telepacífico", fecha="2026-03-01",
                  hora="07:00", titulo=title_a, link=None),
+            # same medio, different hora → NOT duplicate
+            _row(id="33", tipo="Radio", medio="Caracol Radio", fecha="2026-03-01",
+                 hora="09:30", titulo=title_a, link=None),
+            # same medio + hora but different mención → NOT duplicate
+            _row(id="34", tipo="Radio", medio="Caracol Radio", fecha="2026-03-01",
+                 hora="07:00", titulo=title_a, link=None, mencion="Otra Empresa"),
         ]
         out = core.detectar_duplicados(rows)
         self.assertFalse(out[0]["is_duplicate"])
-        self.assertTrue(out[1]["is_duplicate"], "same title+fecha+hora across media is duplicate")
+        self.assertTrue(out[1]["is_duplicate"], "same mención+medio+hora is duplicate even with another title")
         self.assertEqual(str(out[1]["ID duplicada"]), "30")
-        self.assertFalse(out[2]["is_duplicate"], "different Hora is not duplicate")
-        self.assertFalse(out[3]["is_duplicate"], "different Fecha is not duplicate")
+        self.assertFalse(out[2]["is_duplicate"], "different Medio is not duplicate")
+        self.assertFalse(out[3]["is_duplicate"], "different Hora is not duplicate")
+        self.assertFalse(out[4]["is_duplicate"], "different mención is not duplicate")
+        # Same title across media still shares a Grupo noticia and labels.
+        out2, _ = core.process_pipeline([rows[0], rows[2]], "Alcaldía de Cali")
+        self.assertEqual(out2[0]["Grupo noticia"], out2[1]["Grupo noticia"])
+        self.assertEqual(out2[0]["Subtema"], out2[1]["Subtema"])
+
+    def test_05b_streaming_link_same_mencion_duplicate_any_title(self):
+        rows = [
+            _row(id="35", titulo="Primer titular sobre la marca", link=None,
+                 **{"Link (Streaming - Imagen)": {"value": "Link", "url": "https://stream.tv/clip/77"}}),
+            _row(id="36", titulo="Titular totalmente diferente", link=None,
+                 **{"Link (Streaming - Imagen)": {"value": "Link", "url": "https://stream.tv/clip/77?utm_source=x"}}),
+            _row(id="37", titulo="Primer titular sobre la marca", link=None, mencion="Otra Empresa",
+                 **{"Link (Streaming - Imagen)": {"value": "Link", "url": "https://stream.tv/clip/77"}}),
+        ]
+        out = core.detectar_duplicados(rows)
+        self.assertFalse(out[0]["is_duplicate"])
+        self.assertTrue(out[1]["is_duplicate"], "same streaming link + same mención → duplicate")
+        self.assertEqual(str(out[1]["ID duplicada"]), "35")
+        self.assertFalse(out[2]["is_duplicate"], "different mención keeps the row")
 
 
 class TestGroupingAndLabels(unittest.TestCase):
@@ -181,13 +207,62 @@ class TestGroupingAndLabels(unittest.TestCase):
         self.assertFalse(out[0]["is_duplicate"])
         self.assertFalse(out[1]["is_duplicate"])
 
+    def test_06b_title_variants_same_group_same_labels(self):
+        base = "Topos Azteca destacan la solidaridad de los caleños durante las labores de rescate"
+        variants = [
+            f"Video | {base}",
+            f"{base} | El País",
+            "Topos Azteca destacan solidaridad de caleños en labores de rescate",
+            "Los Topos Azteca destacaron la solidaridad de los caleños en el rescate",
+        ]
+        rows = [
+            _row(id=str(60 + k), titulo=t, medio=f"Medio{k}",
+                 resumen=f"Texto propio número {k} sobre la brigada en Cali.",
+                 link={"value": "Link", "url": f"https://m{k}.com/nota-{k}"})
+            for k, t in enumerate(variants)
+        ]
+        rows.append(_row(id="70", titulo="Gobernador anuncia inversión en vías terciarias del Cauca",
+                         resumen="La Gobernación del Cauca invertirá en vías.",
+                         link={"value": "Link", "url": "https://m9.com/vias"}))
+        out, _ = core.process_pipeline(rows, "Topos Azteca", ["Topos"])
+        gids = {r["Grupo noticia"] for r in out[:4]}
+        self.assertEqual(len(gids), 1, f"title variants must share one group: {[r['Grupo noticia'] for r in out]}")
+        self.assertNotEqual(out[4]["Grupo noticia"], out[0]["Grupo noticia"])
+        self.assertEqual(len({r["Tono IA"] for r in out[:4]}), 1)
+        self.assertEqual(len({r["Tema"] for r in out[:4]}), 1)
+        self.assertEqual(len({r["Subtema"] for r in out[:4]}), 1)
+        for r in out[:4]:
+            self.assertFalse(r["is_duplicate"], "different URLs are not duplicates")
+        # Output titles are still the originals.
+        self.assertEqual(out[0]["Título"], variants[0])
+        self.assertEqual(out[1]["Título"], variants[1])
+
     def test_07_bad_labels_rejected_grammatical_replacements(self):
         bad = [
             "Terremoto en colombia ascienden",
             "Sismo en cali cómo saber si",
+            "Alcalde anunció obras en Cali",
+            "Diporto resultados jornada fecha liga",
         ]
         for et in bad:
             self.assertFalse(core.validar_subtema(et), et)
+        for tema in ["Agenda tendrá", "Balance seguridad", "Sismo registra", "Anunció inversión"]:
+            self.assertFalse(core.validar_tema(tema), tema)
+        for tema in ["Seguridad y orden público", "Infraestructura y movilidad", "Salud pública",
+                     "Gestión pública local", "Emergencias y desastres naturales"]:
+            self.assertTrue(core.validar_tema(tema), tema)
+        self.assertEqual(core.fallback_tema("Agenda del concejo", "La agenda del concejo tendrá debates.", "Agenda tendrá"),
+                         "Política y gobierno")
+        self.assertEqual(core.fallback_tema("Inversión en vías terciarias del Cauca", "", ""),
+                         "Infraestructura y movilidad")
+        # Long headline object is trimmed at a phrase boundary, never mid-complement.
+        s = core.fallback_subtema(
+            "Los Topos Azteca llegaron.",
+            "Video | Topos Azteca destacan la solidaridad de los caleños durante las labores de rescate humanitario en Cali",
+        )
+        self.assertTrue(core.validar_subtema(s), s)
+        self.assertTrue(s.endswith("rescate humanitario") or s.endswith("caleños") or s.endswith("de rescate"), s)
+        self.assertNotIn("labores", s.split()[-1], "must not end on a dangling noun of a split complement")
         ctx1 = "Tras el terremoto en Colombia ascienden las víctimas y los heridos."
         ctx2 = "Sismo en Cali: cómo saber si la vivienda quedó bien y qué recomendaciones seguir."
         s1 = core.fallback_subtema(ctx1, "Terremoto en colombia ascienden")
@@ -270,8 +345,8 @@ class TestScaleAndBatching(unittest.TestCase):
                 items.append({
                     "id": it["id"],
                     "tono": "Neutro",
-                    "tema": "Cobertura informativa",
-                    "subtema": "Cobertura de información local",
+                    "tema": "Emergencias y desastres naturales",
+                    "subtema": "Balance de daños del sismo en Cali",
                 })
             return {"items": items}
 
@@ -293,8 +368,10 @@ class TestScaleAndBatching(unittest.TestCase):
         max_pairs = n * (n - 1) // 2
         self.assertLess(prog.comparisons.n, n * 40)
         self.assertLess(prog.comparisons.n, max_pairs // 4)
-        self.assertLessEqual(len(chat_calls), (n + core.CHAT_BATCH_SIZE - 1) // core.CHAT_BATCH_SIZE + 2)
+        # Valid model output ⇒ one batched pass, no repair round.
+        self.assertLessEqual(len(chat_calls), (n + core.CHAT_BATCH_SIZE - 1) // core.CHAT_BATCH_SIZE + 1)
         self.assertGreaterEqual(len(chat_calls), 1)
+        self.assertTrue(all(r["Subtema"] in ("Balance de daños del sismo en Cali", "-") for r in out))
         for prompt in chat_calls:
             # Each request is a batch, not one news item.
             self.assertIn("ÍTEMS:", prompt)
