@@ -3339,7 +3339,7 @@ def main():
         <div class="app-header-icon">◈</div>
         <div class="app-header-text">
             <div class="app-header-title">Análisis de Noticias - API</div>
-            <div class="app-header-version">v18.6 · 😼 Realizado por Johnathan Cortés 🕵️‍♂️ </div>
+            <div class="app-header-version">v18.7 · 😼 Realizado por Johnathan Cortés 🕵️‍♂️ </div>
         </div>
         <div class="app-header-badge">IA</div>
     </div>""", unsafe_allow_html=True)
@@ -3479,7 +3479,7 @@ def main():
         render_sentiment_tab()
 
     st.markdown(
-        '<div class="footer">v18.6 · Análisis de Noticias con IA · Johnathan Cortés ©</div>',
+        '<div class="footer">v18.7 · Análisis de Noticias con IA · Johnathan Cortés ©</div>',
         unsafe_allow_html=True
     )
 
