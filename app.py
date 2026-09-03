@@ -2804,6 +2804,21 @@ def _core_chat_fn(prompt):
     except Exception:
         return content
 
+def _stage_reporter(status, pbar):
+    """Live progress: one tick per pipeline stage (Limpieza … Tema/Subtema)."""
+    def _on_stage(ev):
+        frac = min(1.0, ev.get("index", 1) / max(ev.get("total", 8), 1))
+        try:
+            pbar.progress(frac, text=ev["label"])
+        except TypeError:
+            pbar.progress(frac)
+        try:
+            status.write(ev["label"])
+            status.update(label=ev["label"])
+        except Exception:
+            pass
+    return _on_stage
+
 def _df_rows_for_core(df, title_col, resumen_col, cuerpo_col=None):
     rows = []
     for i, rec in df.iterrows():
@@ -2920,17 +2935,16 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
             return analizar_temas_con_pkl(ctxs, _pkl)
 
     with st.status("Duplicados → Contexto → Embedding único → Agrupación → Tono → Tema/Subtema", expanded=True) as s:
-        pb = st.progress(0)
+        pb = st.progress(0, text="Iniciando…")
         rows, tracker = process_pipeline(
             rows_expanded, bn, ba, km=km,
             embed_fn=_core_embed_fn if use_api or tpkl or epkl else None,
             chat_fn=chat_fn,
             pkl_tono_fn=pkl_tono_fn,
             pkl_tema_fn=pkl_tema_fn,
+            on_stage=_stage_reporter(s, pb),
         )
-        for i, ev in enumerate(tracker.events, start=1):
-            pb.progress(i / max(len(tracker.events), 1), ev["label"])
-            s.write(ev["label"])
+        pb.progress(1.0, text="Pipeline completado")
         st.session_state["pipeline_profile"] = tracker.summary()
         s.update(label=f"✓ Pipeline · chat={tracker.calls.chat} · emb={tracker.calls.embed} · pares={tracker.comparisons.n}", state="complete")
 
@@ -2961,11 +2975,12 @@ async def run_quick_async(df, tc, sc, bn, al):
     get_embedding_cache().clear()
     rows = _df_rows_for_core(df, tc, sc)
     with st.status("Limpieza · Duplicados · Contexto · Embedding único · Agrupación · Tono · Tema/Subtema", expanded=True) as s:
+        pb = st.progress(0, text="Iniciando…")
         out, tracker = process_pipeline(
             rows, bn, al, embed_fn=_core_embed_fn, chat_fn=_core_chat_fn,
+            on_stage=_stage_reporter(s, pb),
         )
-        for ev in tracker.events:
-            s.write(ev["label"])
+        pb.progress(1.0, text="Pipeline completado")
         s.update(label=f"✓ chat={tracker.calls.chat} · emb={tracker.calls.embed}", state="complete")
     df = df.copy()
     df['Tono IA'] = [r.get("Tono IA", "") for r in out]
@@ -3087,15 +3102,16 @@ async def run_custom_excel_async(file_bytes, tc, sc, bn, al, mode="API de OpenAI
     pkl_tono_fn = (lambda ctxs, _pkl=tpkl: analizar_tono_con_pkl(ctxs, _pkl, marca=bn, aliases=al)) if tpkl else None
     pkl_tema_fn = (lambda ctxs, _pkl=epkl: analizar_temas_con_pkl(ctxs, _pkl)) if epkl else None
     with st.status("Limpieza · Duplicados · Contexto · Embedding único · Agrupación · Tono · Tema/Subtema", expanded=True) as s:
+        pb = st.progress(0, text="Iniciando…")
         out, tracker = process_pipeline(
             rows, bn, al,
             embed_fn=_core_embed_fn if use_api or tpkl or epkl else None,
             chat_fn=chat_fn,
             pkl_tono_fn=pkl_tono_fn,
             pkl_tema_fn=pkl_tema_fn,
+            on_stage=_stage_reporter(s, pb),
         )
-        for ev in tracker.events:
-            s.write(ev["label"])
+        pb.progress(1.0, text="Pipeline completado")
         s.update(label=f"✓ chat={tracker.calls.chat} · emb={tracker.calls.embed}", state="complete")
     df = df.copy()
     df['Tono IA'] = [r.get("Tono IA", "") for r in out]
