@@ -46,7 +46,7 @@ MAX_PAIRS_TOTAL = 12000
 MAX_CMP_CHARS = 400
 SIMILARITY_THRESHOLD_TITULOS = 0.84
 SIMILARITY_THRESHOLD_TITULOS_BCAST = 0.86
-SIMILARITY_THRESHOLD_RESUMEN = 0.70
+SIMILARITY_THRESHOLD_RESUMEN = 0.92
 SIMILARITY_THRESHOLD_SEMANTIC = 0.88
 SIMILARITY_SEMANTIC_ALONE = 0.93
 MIN_OVERLAP_GRUPO = 0.30
@@ -54,7 +54,7 @@ JACCARD_TITULO_GRUPO = 0.70
 EMBED_CANDIDATE_MIN = 0.82
 EMBED_NEIGHBORS = 16
 CUERPO_SCAN_CHARS = 8000
-MAX_PALABRAS_SUBTEMA = 9
+MAX_PALABRAS_SUBTEMA = 6
 MIN_PALABRAS_SUBTEMA = 3
 MAX_PALABRAS_TEMA = 5
 
@@ -134,7 +134,8 @@ _TRAILING_INCOMPLETE = {
     "su", "sus", "en", "con", "sin", "por", "para", "sobre", "ante", "bajo",
     "contra", "desde", "entre", "hacia", "hasta", "mediante", "tras", "y", "o",
     "u", "e", "lo", "que", "se", "como", "donde", "cuando", "cual", "cuyo",
-    "si", "cómo", "como", "qué", "cuál",
+    "si", "cómo", "como", "qué", "cuál", "dentro", "fuera", "encima", "debajo",
+    "segun", "según", "via", "vs", "versus", "a",
 }
 
 _CHANNEL_PREFIXES = {
@@ -1037,12 +1038,26 @@ def agrupar_noticias_bloqueado(
     url_n = [normalize_url(u) for u in (urls or [""] * n)]
 
     # Per-row precomputation: tokens/sets built once, not once per pair.
-    res_sets = [set(r.split()[:MAX_CMP_WORDS]) for r in res_n]
     res_pref = [_prefix(r, 10) for r in res_n]
     texto_row = [" ".join(x for x in (tit_n[i], res_n[i], ctx_n[i]) if x) for i in range(n)]
     tok_conf = [_tokens_distintivos(texto_row[i], min_len=3) for i in range(n)]
     tok_ov = [_tokens_distintivos(ctx_n[i] or texto_row[i]) for i in range(n)]
     tok_tit = [_stems(_tokens_distintivos(tit_n[i])) for i in range(n)]
+    tit_clave = []
+    for i in range(n):
+        ordered = []
+        seen = set()
+        for w in tit_n[i].split():
+            if len(w) < 4 or w in _TOKENS_DEBILES or w.isdigit():
+                continue
+            st = _stem_es(w)
+            if st in seen:
+                continue
+            seen.add(st)
+            ordered.append(st)
+            if len(ordered) >= 4:
+                break
+        tit_clave.append(" ".join(ordered))
     # Blocking tokens: headline tokens plus the first distinctive tokens of
     # the resumen/contexto, so paraphrased headlines still meet.
     tok_block = []
@@ -1070,6 +1085,8 @@ def agrupar_noticias_bloqueado(
         rp = _prefix(res_n[i] or ctx_n[i], 12)
         if tp:
             buckets[f"t:{tp}"].append(i)
+        if tit_clave[i] and tit_clave[i].count(" ") >= 2:
+            buckets[f"c:{tit_clave[i]}"].append(i)
         if rp:
             buckets[f"r:{rp}"].append(i)
         if url_n[i]:
@@ -1117,37 +1134,52 @@ def agrupar_noticias_bloqueado(
         return False
 
     for k, (i, j) in enumerate(pares):
-        if _conflicto(i, j):
-            continue
         semantic = float(sem_all[k]) if sem_all is not None else 0.0
         same_url = bool(url_n[i] and url_n[i] == url_n[j])
         inter_t = tok_tit[i] & tok_tit[j]
         shared_t = len(inter_t)
         jac_t = (shared_t / len(tok_tit[i] | tok_tit[j])) if (tok_tit[i] and tok_tit[j] and shared_t) else 0.0
+        titulo_cerca = (
+            _contenido(i, j)
+            or (
+                shared_t >= 4
+                and tok_tit[i] and tok_tit[j]
+                and (tok_tit[i] <= tok_tit[j] or tok_tit[j] <= tok_tit[i])
+            )
+            or (tit_clave[i] and tit_clave[i] == tit_clave[j] and tit_clave[i].count(" ") >= 3)
+            or (jac_t >= 0.80 and shared_t >= 4)
+        )
+        # Opposite-action guard must not split a near-identical headline
+        # (one title is a prefix of the other, extra money/source clause).
+        if _conflicto(i, j) and not titulo_cerca:
+            continue
         overlap = _overlap_sets(tok_ov[i], tok_ov[j])
-        jac_r = _jaccard_sets(res_sets[i], res_sets[j])
-        ov_r = _overlap_sets(res_sets[i], res_sets[j])
-        sim_r = jac_r if ov_r < 0.90 else max(jac_r, ov_r)
-        if sim_r < SIMILARITY_THRESHOLD_RESUMEN and res_pref[i] and res_pref[i] == res_pref[j]:
-            sim_r = max(sim_r, 0.90)
+        # Same-resumen = same opening, not bag-of-words Jaccard.
+        # A 22-word vocabulary over 200 tokens yields Jaccard ~1 for
+        # unrelated notes and used to collapse a 400-row dossier into 1 group.
+        sim_r = 0.0
+        if res_pref[i] and res_pref[i] == res_pref[j]:
+            sim_r = 0.95
+        elif res_n[i][:72] and res_n[i][:72] == res_n[j][:72]:
+            sim_r = 0.95
         mismo_hecho = (
             same_url
-            or _contenido(i, j)
+            or titulo_cerca
             or (jac_t >= JACCARD_TITULO_GRUPO and shared_t >= 4)
-            or (jac_t >= 0.80 and shared_t >= 3)
-            or (jac_t >= 0.50 and shared_t >= 3 and semantic >= 0.82)
+            or (jac_t >= 0.80 and shared_t >= 4)
+            or (jac_t >= 0.50 and shared_t >= 4 and semantic >= 0.82)
             or sim_r >= SIMILARITY_THRESHOLD_RESUMEN
-            or semantic >= SIMILARITY_SEMANTIC_ALONE
-            or (semantic >= SIMILARITY_THRESHOLD_SEMANTIC and overlap >= MIN_OVERLAP_GRUPO)
+            or (semantic >= SIMILARITY_SEMANTIC_ALONE and shared_t >= 4)
+            or (semantic >= SIMILARITY_THRESHOLD_SEMANTIC and overlap >= MIN_OVERLAP_GRUPO and shared_t >= 3)
         )
         # Gray zone only: near-paraphrase titles that set metrics miss.
         # SequenceMatcher stays off the common path (was ~1.5 ms × 8k pairs).
         if (
             not mismo_hecho
             and tit_n[i] and tit_n[j]
-            and shared_t >= 2
+            and shared_t >= 4
             and semantic >= 0.75
-            and jac_t >= 0.30
+            and jac_t >= 0.40
         ):
             if _ratio(tit_n[i], tit_n[j], SIMILARITY_THRESHOLD_TITULOS) >= SIMILARITY_THRESHOLD_TITULOS:
                 mismo_hecho = True
@@ -1178,18 +1210,47 @@ def _palabras(etiqueta: str) -> List[str]:
     return [p for p in re.split(r"\s+", (etiqueta or "").strip()) if p]
 
 
+_INICIO_PROHIBIDO = {
+    "multiples", "multiple", "diversos", "diversas", "varios", "varias",
+    "algunos", "algunas", "escalables", "escalable", "destacada", "destacado",
+    "destacadas", "destacados", "elegida", "elegido", "premiada", "premiado",
+}
+
+
+def _ultima_palabra(etiqueta: str) -> str:
+    words = _palabras(etiqueta)
+    if not words:
+        return ""
+    return unidecode(words[-1].lower().rstrip(".,;:!?¿¡\"'$"))
+
+
+def _termina_en_cifra_o_monto(etiqueta: str) -> bool:
+    last = _ultima_palabra(etiqueta)
+    if not last:
+        return False
+    if re.search(r"\d", last) or last in {"millones", "millon", "mil", "usd", "us", "dolares", "pesos", "cop"}:
+        return True
+    if re.search(r"\$|\bus\$?\s*\d|\d[\d.,]*\s*(millones|mil)?\s*$", etiqueta, flags=re.I):
+        return True
+    return False
+
+
 def validar_subtema(etiqueta: str) -> bool:
-    """Reject ungrammatical keyword/title fragments. Noun phrase, 3–7 words."""
+    """Complete topical noun phrase, 3–6 words. Report heading, not a fragment."""
     if not etiqueta or not str(etiqueta).strip():
         return False
     et = str(etiqueta).strip().strip(" .;:¡!¿?")
+    if "," in et or ";" in et or ":" in et:
+        return False
     if _es_generica(et):
         return False
     words = _palabras(et)
     if not (MIN_PALABRAS_SUBTEMA <= len(words) <= MAX_PALABRAS_SUBTEMA):
         return False
-    last = unidecode(words[-1].lower().rstrip(".,;:!?¿¡"))
+    last = _ultima_palabra(et)
     if last in _TRAILING_INCOMPLETE or last in _QUESTION_TAILS:
+        return False
+    if _termina_en_cifra_o_monto(et):
         return False
     if _es_verbo_conjugado(words[-1]) or _es_verbo_conjugado(words[0]):
         return False
@@ -1197,18 +1258,22 @@ def validar_subtema(etiqueta: str) -> bool:
         return False
     if any(unidecode(w.lower()) in {"como", "cómo"} for w in words):
         return False
-    if unidecode(words[0].lower()) in _DROP_LEAD | {"que", "y", "o", "pero"}:
+    first = unidecode(words[0].lower().rstrip(".,;:"))
+    if first in _DROP_LEAD | _INICIO_PROHIBIDO | {"que", "y", "o", "pero"}:
         return False
     head = " ".join(unidecode(w.lower()) for w in words[:2])
-    if unidecode(words[0].lower()) in _CHANNEL_PREFIXES or head in _CHANNEL_PREFIXES:
+    if first in _CHANNEL_PREFIXES or head in _CHANNEL_PREFIXES:
         return False
     if "|" in et or et.lower().startswith("video"):
         return False
+    # Participle + preposition is a headline leftover, not a topic
+    # ('Destacada entre las sociólogas…').
+    if len(words) >= 2 and re.search(r"(?:ada|ado|idas|idos|ida|ido)$", first):
+        if unidecode(words[1].lower()) in _NEXOS | {"entre", "como"}:
+            return False
     nexos = [unidecode(w.lower()) for w in words[1:] if unidecode(w.lower()) in _NEXOS]
     content = [w for w in words if unidecode(w.lower()) not in _NEXOS | STOPWORDS_ES]
     if not nexos:
-        # Without a preposition only 'Noun + adjective(s)' is a phrase;
-        # anything else is a keyword collage ('Diporto resultados jornada').
         if not all(_parece_adjetivo(w) for w in words[1:]):
             return False
     if len(content) >= 4 and not nexos:
@@ -1220,17 +1285,19 @@ def validar_subtema(etiqueta: str) -> bool:
 
 def validar_tema(etiqueta: str) -> bool:
     """Tema: coherent thematic noun phrase, 2–5 words, no verbs, no
-    question tails, no bare keyword pair ('Agenda tendrá', 'Balance seguridad')."""
+    commas, no numbers, no keyword collage."""
     if not etiqueta or not str(etiqueta).strip():
         return False
     et = str(etiqueta).strip()
-    if "?" in et or "¿" in et or "|" in et or _es_generica(et):
+    if "?" in et or "¿" in et or "|" in et or "," in et or ";" in et or _es_generica(et):
         return False
     words = _palabras(et)
     if not (2 <= len(words) <= MAX_PALABRAS_TEMA):
         return False
-    last = unidecode(words[-1].lower().rstrip(".,;:!?¿¡"))
+    last = _ultima_palabra(et)
     if last in _TRAILING_INCOMPLETE or last in _QUESTION_TAILS:
+        return False
+    if _termina_en_cifra_o_monto(et):
         return False
     if any(_es_verbo_conjugado(w) for w in words):
         return False
@@ -1238,11 +1305,7 @@ def validar_tema(etiqueta: str) -> bool:
         return False
     content = [w for w in words if unidecode(w.lower()) not in _NEXOS | STOPWORDS_ES | {"y", "e"}]
     nexos = [w for w in words if unidecode(w.lower()) in _NEXOS | {"y", "e"}]
-    # Two bare content words glued together ("Balance seguridad") is a
-    # keyword collage unless the second is an adjective-like modifier.
     if not nexos and len(words) >= 2:
-        # Noun + adjective(s) is fine ('Seguridad ciudadana', 'Gestión
-        # pública local'); noun + noun is a collage ('Balance seguridad').
         if not all(_parece_adjetivo(w) for w in words[1:]):
             return False
     if len(content) >= 4 and not nexos:
@@ -1251,7 +1314,7 @@ def validar_tema(etiqueta: str) -> bool:
 
 
 def _capitalizar(frase: str) -> str:
-    frase = re.sub(r"\s+", " ", (frase or "").strip())
+    frase = re.sub(r"\s+", " ", (frase or "").strip().strip(" ,;:."))
     if not frase:
         return ""
     return frase[0].upper() + frase[1:]
@@ -1283,11 +1346,26 @@ _VERBOS_TITULAR = re.compile(
     r"busca|buscan|busco|explica|explican|explico|analiza|analizan|analizo|"
     r"promueve|promueven|promovio|realiza|realizan|realizo|ofrece|ofrecen|ofrecio|"
     r"suspende|suspenden|suspendio|cierra|cierran|cerro|activa|activan|activo|"
-    r"refuerza|refuerzan|reforzo|amplia|amplian|amplio|reduce|reducen|redujo)\b"
+    r"refuerza|refuerzan|reforzo|amplia|amplian|amplio|reduce|reducen|redujo|"
+    r"compra|compro|compraron|adquiere|adquirio|adquirieron)\b"
 )
 
 _DROP_LEAD = {"otro", "otra", "otros", "otras", "este", "esta", "estos", "estas",
               "nuevo", "nueva", "nuevos", "nuevas", "asi", "hoy", "ayer", "ahora"}
+
+_VERBO_A_EVENTO = [
+    (re.compile(r"\b(adquiri[oó]|adquiere|adquirieron|compra|compr[oó]|compraron|comprado)\b", re.I), "Adquisición"),
+    (re.compile(r"\b(invirti[oó]|invierte|invierten|inversion)\b", re.I), "Inversión"),
+    (re.compile(r"\b(lanz[oó]|lanza|lanzan|lanzamiento)\b", re.I), "Lanzamiento"),
+    (re.compile(r"\b(inaugur[oó]|inaugura|inauguran)\b", re.I), "Inauguración"),
+    (re.compile(r"\b(anunci[oó]|anuncia|anuncian)\b", re.I), "Anuncio"),
+    (re.compile(r"\b(firm[oó]|firma|firman|convenio)\b", re.I), "Convenio"),
+    (re.compile(r"\b(aprob[oó]|aprueba|aprueban)\b", re.I), "Aprobación"),
+    (re.compile(r"\b(rechaz[oó]|rechaza|rechazan)\b", re.I), "Rechazo"),
+    (re.compile(r"\b(reconoc|premi[oó]|galardon|destacad[oa]s? entre|eligi[oó])\b", re.I), "Reconocimiento"),
+    (re.compile(r"\b(present[oó]|presenta|presentan)\b", re.I), "Presentación"),
+    (re.compile(r"\b(entreg[oó]|entrega|entregan)\b", re.I), "Entrega"),
+]
 
 
 def _limpiar_titular(titulo: str) -> str:
@@ -1296,6 +1374,78 @@ def _limpiar_titular(titulo: str) -> str:
                "", t, flags=re.I)
     t = t.split("|")[-1] if "|" in t else t
     return re.sub(r"\s+", " ", t).strip(" .:;-–—")
+
+
+def _entidad_inicial(titulo: str) -> str:
+    """Company/person named at the start of the headline, before a comma."""
+    limpio = _limpiar_titular(titulo)
+    if not limpio:
+        return ""
+    cabeza = re.split(r"[,:;–—]", limpio, maxsplit=1)[0].strip()
+    words = [w for w in cabeza.split() if w]
+    if 1 <= len(words) <= 4 and not any(_es_verbo_conjugado(w) for w in words):
+        return " ".join(words)
+    return words[0] if words else ""
+
+
+def _entidad_en_resto(resto: str) -> str:
+    """First proper-noun-like token in the remainder, ignoring money."""
+    limpio = re.sub(r"\bpor\s+US\$?\s*[\d.,]+\s*(millones?)?", " ", resto or "", flags=re.I)
+    limpio = re.sub(r"US\$?\s*[\d.,]+|\$(?:\d[\d.,]*)", " ", limpio)
+    limpio = re.sub(r"\b\d[\d.,]*\b", " ", limpio)
+    for w in limpio.split():
+        wl = unidecode(w.lower().strip(".,;:"))
+        if len(wl) < 3 or wl in STOPWORDS_ES | _DROP_LEAD | {"ia"}:
+            continue
+        if w[:1].isupper() or (wl[0].isalpha() and wl not in STOPWORDS_ES):
+            return w.strip(".,;:")
+    return ""
+
+
+def _evento_del_verbo(texto: str) -> str:
+    plano = unidecode(texto or "")
+    for pat, evento in _VERBO_A_EVENTO:
+        if pat.search(plano) or pat.search(texto or ""):
+            return evento
+    return ""
+
+
+def _nominalizar_titular(titulo: str) -> str:
+    """Headline → 3–6 word topic ('Adquisición de InterPositive por Netflix')."""
+    limpio = _limpiar_titular(titulo)
+    if not limpio:
+        return ""
+    entidad = _entidad_inicial(limpio)
+    rel = re.match(
+        r"^(.{2,80}?),\s+(?:la|el|los|las)\s+.+?\s+que\s+(\S+)\s+(.+)$",
+        limpio, flags=re.I | re.S,
+    )
+    if rel:
+        entidad = entidad or rel.group(1).strip()
+        evento = _evento_del_verbo(rel.group(2)) or _evento_del_verbo(rel.group(3)) or _evento_del_verbo(limpio)
+        otra = _entidad_en_resto(rel.group(3))
+        if evento and entidad:
+            if otra and unidecode(otra.lower()) != unidecode(entidad.split()[0].lower()):
+                frase = f"{evento} de {entidad} por {otra}"
+            else:
+                frase = f"{evento} de {entidad}"
+            frase = _capitalizar(" ".join(_recortar_sintagma(frase.split(), MAX_PALABRAS_SUBTEMA)))
+            if validar_subtema(frase):
+                return frase
+    evento = _evento_del_verbo(limpio)
+    if evento and entidad:
+        otra = ""
+        m = re.search(r"\b(?:por|de)\s+([A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ]+)", limpio)
+        if m and unidecode(m.group(1).lower()) not in STOPWORDS_ES:
+            otra = m.group(1)
+        if otra and unidecode(otra.lower()) != unidecode(entidad.split()[0].lower()):
+            frase = f"{evento} de {entidad} por {otra}"
+        else:
+            frase = f"{evento} de {entidad}"
+        frase = _capitalizar(" ".join(_recortar_sintagma(frase.split(), MAX_PALABRAS_SUBTEMA)))
+        if validar_subtema(frase):
+            return frase
+    return ""
 
 
 def _objeto_tras_verbo(titulo: str) -> str:
@@ -1321,6 +1471,12 @@ def _objeto_tras_verbo(titulo: str) -> str:
     words = resto.split()
     while words and unidecode(words[0].lower()) in _DROP_LEAD | {"que", "a", "al", "el", "la", "los", "las", "un", "una", "unos", "unas", "su", "sus"}:
         words.pop(0)
+    if not words:
+        return ""
+    # Money / proper-noun fragments are not topics ('Netflix por US$587 millones').
+    cand_raw = " ".join(words)
+    if _termina_en_cifra_o_monto(cand_raw) or re.search(r"\$|\d", cand_raw):
+        return ""
     words = _recortar_sintagma(words, MAX_PALABRAS_SUBTEMA)
     frase = _capitalizar(" ".join(words))
     return frase if validar_subtema(frase) else ""
@@ -1328,21 +1484,21 @@ def _objeto_tras_verbo(titulo: str) -> str:
 
 def fallback_subtema(contexto: str, titulo: str = "") -> str:
     """
-    Deterministic grammatical noun phrase from a parsed sentence.
-    Used when the model/heuristic would otherwise emit a keyword collage.
+    Deterministic 3–6 word topical noun phrase from the HEADLINE.
+    Context is a mention window and often a product blurb — never the
+    source of the object-after-verb heuristic.
     """
-    texto = " ".join(x for x in (contexto, titulo) if x).strip()
-    norm = _norm_text(texto)
-    sent = re.split(r"(?<=[\.\!\?])\s+", texto.strip())[0] if texto.strip() else ""
+    # 1) Nominalize the event named in the title.
+    nom = _nominalizar_titular(titulo)
+    if nom:
+        return nom
 
-    # 1) Object of the headline verb: 'Alcalde presenta balance de seguridad
-    #    en Cali' → 'Balance de seguridad en Cali'.
-    desde_titular = _objeto_tras_verbo(titulo) or _objeto_tras_verbo(sent)
+    # 2) Object of the headline verb, only if it is already a complete topic.
+    desde_titular = _objeto_tras_verbo(titulo)
     if desde_titular:
         return desde_titular
 
-    # 2) A verb-less headline is already a noun phrase ('Balance de víctimas
-    #    del terremoto en el Valle'): use it, trimmed at a phrase boundary.
+    # 3) A verb-less headline is already a noun phrase.
     limpio = _limpiar_titular(titulo)
     if limpio:
         cand_words = re.split(r"[\.\?\!¿¡]|\s[-–—]\s|:\s", limpio)[0].split()
@@ -1352,7 +1508,10 @@ def fallback_subtema(contexto: str, titulo: str = "") -> str:
         if cand and validar_subtema(cand) and not any(_es_verbo_conjugado(w) for w in cand.split()):
             return cand
 
-    # 3) Generic topical patterns (no brand- or client-specific rules).
+    texto = " ".join(x for x in (titulo, contexto) if x).strip()
+    norm = _norm_text(texto)
+
+    # 4) Generic topical patterns (no brand- or client-specific rules).
     if re.search(r"\b(terremoto|sismo|temblor)\b", norm) and re.search(
         r"\b(victima|victimas|muerto|muertos|herido|heridos|asciend|fallecid)", norm
     ):
@@ -1365,31 +1524,36 @@ def fallback_subtema(contexto: str, titulo: str = "") -> str:
         return "Cobertura del sismo en Colombia"
     if re.search(r"\b(jornada|fecha)\b", norm) and re.search(r"\b(resultado|resultados|liga|torneo|partido)\b", norm):
         return "Resultados de la jornada deportiva"
+    if re.search(r"\b(adquisicion|adquiri|compr[oó]|compra de)\b", norm) and re.search(r"\b(ia|inteligencia|startup|tecnolog)\b", norm):
+        ent = _entidad_inicial(titulo) or "la compañía"
+        frase = f"Adquisición de {ent}"
+        if validar_subtema(frase):
+            return _capitalizar(frase)
 
-    # Noun-phrase from the headline (or first sentence): drop channel
-    # prefixes, verbs and filler leads before composing "X de Y".
-    raw = _limpiar_titular(titulo) or _limpiar_titular(sent)
+    # 5) Last resort: entity + generic coverage. Never scrape a context blurb.
+    ent = _entidad_inicial(titulo)
+    if ent and len(ent.split()) <= 3:
+        frase = f"Cobertura sobre {ent}"
+        if validar_subtema(frase):
+            return _capitalizar(frase)
+    raw = _limpiar_titular(titulo) or _limpiar_titular(re.split(r"(?<=[\.\!\?])\s+", (contexto or "").strip())[0] if contexto else "")
     toks = [t for t in re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]+", raw) if t]
     drop = STOPWORDS_ES | _CHANNEL_PREFIXES | _CONJUGATED_TAILS | _QUESTION_TAILS | _DROP_LEAD
     kept = []
     for t in toks:
         tl = unidecode(t.lower())
-        if tl in drop or tl in _CONJUGATED_TAILS:
+        if tl in drop or tl in _CONJUGATED_TAILS or re.search(r"\d", tl):
             continue
         if len(tl) < 3:
             continue
         kept.append(t)
-        if len(kept) >= 4:
+        if len(kept) >= 3:
             break
     if len(kept) >= 2:
-        frase = f"{kept[0]} de {' '.join(kept[1:3])}"
-        frase = _capitalizar(frase)
+        frase = f"{kept[0]} de {' '.join(kept[1:3])}" if len(kept) >= 3 else f"{kept[0]} de {kept[1]}"
+        frase = _capitalizar(" ".join(_recortar_sintagma(frase.split(), MAX_PALABRAS_SUBTEMA)))
         if validar_subtema(frase):
             return frase
-        frase2 = f"Cobertura de {kept[0].lower()} en {kept[1]}"
-        frase2 = _capitalizar(frase2)
-        if validar_subtema(frase2):
-            return frase2
     if kept:
         frase = f"Cobertura sobre {kept[0].lower()}"
         if validar_subtema(frase):
@@ -1425,6 +1589,7 @@ TAXONOMIA_TEMAS: Dict[str, Tuple[str, ...]] = {
         "exportacion", "impuesto", "tributaria", "banco", "credito", "pib", "mercado",
         "negocio", "ventas", "consumo", "industria", "emprendimiento", "financiero",
         "bolsa", "arancel", "importacion", "ganancia", "utilidades", "cifras economicas",
+        "adquisicion", "compra", "fusion", "millones",
     ),
     "Empleo y trabajo": (
         "empleo", "trabajador", "sindicato", "salario", "desempleo", "paro", "huelga",
@@ -1479,6 +1644,7 @@ TAXONOMIA_TEMAS: Dict[str, Tuple[str, ...]] = {
     "Tecnología e innovación": (
         "tecnologia", "digital", "inteligencia artificial", "innovacion", "app",
         "ciberseguridad", "software", "plataforma", "startup", "datos", "conectividad",
+        "adquisicion", "ia", "netflix", "algoritmo", "aplicacion",
     ),
     "Turismo y destinos": (
         "turismo", "turista", "hotel", "destino", "temporada", "visitante", "viajero",
@@ -1506,10 +1672,16 @@ def tema_por_taxonomia(subtema: str, contexto: str = "", titulo: str = "") -> st
             if not texto:
                 continue
             padded = f" {texto} "
+            tokens = set(texto.split())
             for k in claves:
-                if f" {k}" in padded:
-                    # Stem-tolerant: 'via' matches 'vias', 'victima' 'victimas'.
-                    # Multi-word keys are more specific and break ties.
+                # Token boundary so 'cine' does not match 'cineastas'.
+                hit = (
+                    k in tokens
+                    or f" {k} " in padded
+                    or f" {k}s " in padded
+                    or (len(k) >= 5 and any(t.startswith(k) and len(t) <= len(k) + 2 for t in tokens))
+                )
+                if hit:
                     puntajes[tema] += peso * (2 if " " in k else 1)
     if not puntajes:
         return ""
@@ -1630,28 +1802,34 @@ def clasificar_lotes(
         cabecera = (
             f"Eres un analista senior de medios en Colombia. Marca analizada: '{marca}'"
             + (f" (alias: {aliases_str})" if aliases_str else "")
-            + ".\nPara cada ítem analiza ÚNICAMENTE el campo 'contexto' (es el Contexto analizado: "
-            "párrafo con la mención de la marca; si no la menciona, es el resumen o el título).\n"
+            + ".\nPara cada ítem el campo 'titulo' nombra el HECHO de la noticia y 'contexto' es el "
+            "párrafo de mención de la marca (si no hay mención, es resumen o título). "
+            "El subtema debe reflejar el hecho del TÍTULO, no un detalle técnico del contexto.\n"
         )
         formato = (
             "Devuelve SOLO JSON: {\"items\":[{\"id\":0,\"tono\":\"Positivo|Negativo|Neutro\","
             "\"tema\":\"...\",\"subtema\":\"...\"}]}\n"
         )
         reglas = (
-            "SUBTEMA (hecho concreto, 4-9 palabras): frase nominal COMPLETA y coherente en español "
-            "de Colombia que describa el hecho específico de la noticia. Debe tener núcleo "
-            "sustantivo + complemento con preposición (de/del/en/para/sobre/ante/por). "
-            "Tildes correctas. PROHIBIDO: unir palabras clave sueltas ('Diporto resultados jornada'), "
-            "verbos conjugados ('ascienden', 'tendrá', 'anunció'), colas interrogativas ('cómo saber si'), "
-            "prefijos de canal ('Video', 'En vivo'), copiar o recortar el titular, terminar en "
-            "preposición o artículo, frases genéricas ('Cobertura informativa').\n"
-            "  Correcto: 'Balance de víctimas del terremoto en el suroccidente', "
-            "'Recomendaciones ante sismos para viviendas en Cali', "
-            "'Inversión en vías terciarias del Cauca'.\n"
-            "  Incorrecto: 'Terremoto en colombia ascienden', 'Sismo en cali cómo saber si', "
-            "'Agenda tendrá', 'Balance seguridad'.\n"
-            "TEMA (ámbito, 2-5 palabras): categoría temática nominal, más general que el subtema, "
-            "sin verbos ni nombres propios. Usa preferiblemente una de estas o una equivalente: "
+            "El SUBTEMA y el TEMA son encabezados de un reporte: deben decir DE QUÉ TRATÓ la noticia, "
+            "completos y comprensibles, para poder contar cuántos temas hubo y agrupar notas similares.\n"
+            "SUBTEMA (3 a 6 palabras, máximo 6): frase nominal COMPLETA en español de Colombia. "
+            "Núcleo sustantivo + complemento con de/del/en/para/sobre/ante/por. Sin comas. "
+            "No termine en número, cifra, millón(es), signo $, preposición ni artículo. "
+            "Usa el TÍTULO para nombrar el hecho; el contexto solo aclara. "
+            "PROHIBIDO: recortar el titular, copiar el objeto de un verbo ('Netflix por US$587 millones'), "
+            "detalles de producto ('Múltiples y escalables a todas las fases de producción'), "
+            "partícipios colgados ('Destacada entre las sociólogas… dentro'), verbos conjugados, "
+            "colas interrogativas, prefijos de canal, unir palabras clave sueltas.\n"
+            "  Correcto: 'Adquisición de InterPositive por Netflix', "
+            "'Solidaridad de caleños en rescate', "
+            "'Inversión en vías del Cauca'.\n"
+            "  Incorrecto: 'Netflix por US$587 millones', "
+            "'Múltiples y escalables a todas las fases de producción', "
+            "'Destacada entre las sociólogas más influyentes del país dentro', "
+            "'Terremoto en colombia ascienden'.\n"
+            "TEMA (ámbito, 2-5 palabras): categoría más general que el subtema, sin comas, "
+            "sin verbos, sin cifras, sin nombres propios. Prefiere una de: "
             f"{temas_sugeridos}.\n"
             "TONO: impacto reputacional DIRECTO sobre la marca (no el tono general de la noticia). "
             "Positivo si la marca logra, gana, aporta, es reconocida; Negativo si es cuestionada, "
@@ -1693,7 +1871,8 @@ def clasificar_lotes(
             it = items[i]
             entry = {
                 "id": i,
-                "contexto": str(it.get("contexto") or "")[:1100],
+                "titulo": str(it.get("titulo") or "")[:220],
+                "contexto": str(it.get("contexto") or "")[:900],
             }
             if reparacion:
                 entry["rechazadas"] = rejected.get(i, [])[:4]
@@ -1792,11 +1971,22 @@ def consolidar_temas_lote(labels: List[Dict[str, str]]) -> List[Dict[str, str]]:
 # ---------------------------------------------------------------------------
 
 def _mejor_representante(idxs: Sequence[int], contextos: Sequence[str],
-                         embeddings: Optional[Sequence[Any]] = None) -> int:
+                         embeddings: Optional[Sequence[Any]] = None,
+                         titulos: Optional[Sequence[Any]] = None) -> int:
     if not idxs:
         return 0
     con = [i for i in idxs if str(contextos[i] or "").strip()]
     pool = con or list(idxs)
+    # The longest headline is the most complete naming of the fact
+    # (prefix titles like '...compró Netflix' vs '...por US$587 millones').
+    if titulos is not None:
+        return max(
+            pool,
+            key=lambda i: (
+                len(normalize_title_for_comparison(titulos[i])),
+                len(str(contextos[i] or "")),
+            ),
+        )
     if embeddings is not None:
         vecs = [(i, embeddings[i]) for i in pool if embeddings[i] is not None]
         if len(vecs) >= 2:
@@ -1895,11 +2085,11 @@ def process_pipeline(
     reps = []
     gid_of_rep = []
     for gid, idxs in grupos.items():
-        ri = _mejor_representante(idxs, contextos, embeddings)
+        ri = _mejor_representante(idxs, contextos, embeddings, titulos)
         # Prefer a non-duplicate representative when the group has one.
         nondup = [j for j in idxs if not out[j].get("is_duplicate")]
         if nondup:
-            ri = _mejor_representante(nondup, contextos, embeddings)
+            ri = _mejor_representante(nondup, contextos, embeddings, titulos)
         reps.append({
             "id": ri,
             "contexto": contextos[ri],
