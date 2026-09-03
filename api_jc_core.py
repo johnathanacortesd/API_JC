@@ -12,8 +12,10 @@ import hashlib
 import io
 import json
 import re
+import threading
 import time
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -29,12 +31,17 @@ except Exception:  # pragma: no cover
     cosine_similarity = None
 
 
+_COUNTER_LOCK = threading.Lock()
+
 OPENAI_MODEL_EMBEDDING = "text-embedding-3-small"
 OPENAI_MODEL_CLASIFICACION = "gpt-4.1-nano-2025-04-14"
 CHAT_BATCH_SIZE = 30
+CHAT_PARALLEL_BATCHES = 4
 REQUEST_TIMEOUT_S = 25
 MAX_RETRIES = 2
 MAX_BUCKET = 80
+MAX_PAIRS_TOTAL = 40000
+MAX_CMP_CHARS = 400
 SIMILARITY_THRESHOLD_TITULOS = 0.92
 SIMILARITY_THRESHOLD_TITULOS_BCAST = 0.86
 SIMILARITY_THRESHOLD_RESUMEN = 0.86
@@ -201,12 +208,13 @@ class ProgressTracker:
         "Agrupación", "Tono", "Tema/Subtema", "Excel",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, on_stage: Optional[Callable[[Dict[str, Any]], None]] = None) -> None:
         self.t0 = time.time()
         self.events: List[Dict[str, Any]] = []
         self.calls = CallCounter()
         self.comparisons = ComparisonCounter()
         self._current = None
+        self.on_stage = on_stage
 
     def stage(self, name: str, extra: str = "") -> Dict[str, Any]:
         elapsed = time.time() - self.t0
@@ -223,8 +231,15 @@ class ProgressTracker:
                 + (f" · {extra}" if extra else "")
             ),
         }
+        ev["index"] = len(self.events) + 1
+        ev["total"] = len(self.STAGES)
         self.events.append(ev)
         self._current = ev
+        if self.on_stage is not None:
+            try:
+                self.on_stage(ev)
+            except Exception:
+                pass
         return ev
 
     def summary(self) -> str:
@@ -455,11 +470,39 @@ def _hay_conflicto_accion(a: str, b: str) -> bool:
     return False
 
 
-def _ratio(a: str, b: str) -> float:
+def _ratio(a: str, b: str, threshold: float = 0.0) -> float:
+    """Character SequenceMatcher for SHORT strings (titles), capped in length."""
     from difflib import SequenceMatcher
     if not a or not b:
         return 0.0
-    return SequenceMatcher(None, a, b).ratio()
+    a, b = a[:MAX_CMP_CHARS], b[:MAX_CMP_CHARS]
+    sm = SequenceMatcher(None, a, b)
+    if threshold > 0 and sm.real_quick_ratio() < threshold:
+        return 0.0
+    return sm.ratio()
+
+
+MAX_CMP_WORDS = 80
+
+
+def _ratio_palabras(a_words: Sequence[str], b_words: Sequence[str], threshold: float = 0.0) -> float:
+    """Word-level similarity for resúmenes.
+
+    Character-level ratio() is O(len_a*len_b) and froze the UI on 1.5k-char
+    summaries. Word sequences (≤80 tokens) give the same "same text" signal
+    at ~1/100 of the cost. A set-overlap gate skips hopeless pairs first.
+    """
+    from difflib import SequenceMatcher
+    if not a_words or not b_words:
+        return 0.0
+    a_words, b_words = a_words[:MAX_CMP_WORDS], b_words[:MAX_CMP_WORDS]
+    if threshold > 0:
+        sa, sb = set(a_words), set(b_words)
+        upper = 2.0 * len(sa & sb) / max(1, len(a_words) + len(b_words))
+        # upper bound of ratio() when every shared token could align
+        if upper < threshold * 0.5:
+            return 0.0
+    return SequenceMatcher(None, a_words, b_words, autojunk=False).ratio()
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +530,9 @@ def detectar_duplicados(rows: Sequence[Dict[str, Any]],
     processed = deepcopy(list(rows))
     seen_url: Dict[Tuple[str, str], int] = {}
     seen_bcast: Dict[Tuple[str, str, str, str], int] = {}
+    # (mencion, fecha, hora) -> [(titulo_norm, idx)] so similar-title checks
+    # only scan the same broadcast slot, never the whole dossier.
+    bcast_slot: Dict[Tuple[str, str, str], List[Tuple[str, int]]] = defaultdict(list)
 
     for i, row in enumerate(processed):
         row.setdefault("is_duplicate", False)
@@ -524,16 +570,12 @@ def detectar_duplicados(rows: Sequence[Dict[str, Any]],
                 row["Subtema"] = "-"
                 continue
             matched = None
-            for prev_key, prev_i in seen_bcast.items():
-                p_menc, p_fecha, p_hora, p_tit = prev_key
-                if p_menc != mencion or p_fecha != fecha or p_hora != hora:
-                    continue
-                sim = _ratio(titulo, p_tit)
+            for p_tit, prev_i in bcast_slot.get((mencion, fecha, hora), []):
                 contained = (
                     len(titulo) >= 20 and len(p_tit) >= 20
                     and (titulo in p_tit or p_tit in titulo)
                 )
-                if sim >= SIMILARITY_THRESHOLD_TITULOS_BCAST or contained:
+                if contained or _ratio(titulo, p_tit, SIMILARITY_THRESHOLD_TITULOS_BCAST) >= SIMILARITY_THRESHOLD_TITULOS_BCAST:
                     matched = prev_i
                     break
             if matched is not None:
@@ -545,6 +587,7 @@ def detectar_duplicados(rows: Sequence[Dict[str, Any]],
                 row["Subtema"] = "-"
             else:
                 seen_bcast[exact] = i
+                bcast_slot[(mencion, fecha, hora)].append((titulo, i))
     return processed
 
 
@@ -716,13 +759,16 @@ def _candidate_pairs(n: int, buckets: Dict[str, List[int]],
                      counter: Optional[ComparisonCounter] = None
                      ) -> List[Tuple[int, int]]:
     pares = set()
-    for idxs in buckets.values():
+    # Smallest buckets first: the most specific evidence wins the pair budget.
+    for idxs in sorted(buckets.values(), key=len):
         if len(idxs) < 2 or len(idxs) > MAX_BUCKET:
             continue
         orden = sorted(set(idxs))
         for a in range(len(orden)):
             for b in range(a + 1, len(orden)):
                 pares.add((orden[a], orden[b]))
+        if len(pares) >= MAX_PAIRS_TOTAL:
+            break
     if counter:
         counter.add(len(pares))
     return sorted(pares)
@@ -770,26 +816,49 @@ def agrupar_noticias_bloqueado(
     pares = _candidate_pairs(n, buckets, counter)
 
     embs = list(embeddings) if embeddings is not None else [None] * n
-    can_cos = cosine_similarity is not None
+    # Unit-normalize once; per-pair sklearn cosine_similarity cost ~3ms each
+    # (≈30s for 9k pairs). A dot product of unit vectors is the same number.
+    unit = [None] * n
+    for k, e in enumerate(embs):
+        if e is None:
+            continue
+        v = np.asarray(e, dtype=float).ravel()
+        nrm = np.linalg.norm(v)
+        unit[k] = v / nrm if nrm > 0 else None
+    can_cos = True
+
+    # Per-row precomputation: tokens are built once, not once per pair.
+    res_words = [r.split()[:MAX_CMP_WORDS] for r in res_n]
+    res_pref = [_prefix(r, 10) for r in res_n]
+    texto_row = [" ".join(x for x in (tit_n[i], res_n[i], ctx_n[i]) if x) for i in range(n)]
+    tok_conf = [_tokens_distintivos(texto_row[i], min_len=3) for i in range(n)]
+    tok_ov = [_tokens_distintivos(ctx_n[i] or texto_row[i]) for i in range(n)]
+
+    def _conflicto(i: int, j: int) -> bool:
+        ta, tb = tok_conf[i], tok_conf[j]
+        for ga, gb in _ACCIONES_OPUESTAS:
+            if (ta & ga and tb & gb) or (ta & gb and tb & ga):
+                return True
+        return False
+
+    def _overlap(i: int, j: int) -> float:
+        ta, tb = tok_ov[i], tok_ov[j]
+        if not ta or not tb:
+            return 0.0
+        return len(ta & tb) / max(1, min(len(ta), len(tb)))
 
     for i, j in pares:
-        texto_i = " ".join(x for x in (tit_n[i], res_n[i], ctx_n[i]) if x)
-        texto_j = " ".join(x for x in (tit_n[j], res_n[j], ctx_n[j]) if x)
-        if _hay_conflicto_accion(texto_i, texto_j):
+        if _conflicto(i, j):
             continue
-        sim_t = _ratio(tit_n[i], tit_n[j]) if tit_n[i] and tit_n[j] else 0.0
-        sim_r = _ratio(res_n[i], res_n[j]) if res_n[i] and res_n[j] else 0.0
-        if sim_r < SIMILARITY_THRESHOLD_RESUMEN and res_n[i] and res_n[j]:
-            # prefix equality still counts as similar resumen
-            if _prefix(res_n[i], 10) and _prefix(res_n[i], 10) == _prefix(res_n[j], 10):
-                sim_r = max(sim_r, 0.90)
+        sim_t = _ratio(tit_n[i], tit_n[j], SIMILARITY_THRESHOLD_TITULOS) if tit_n[i] and tit_n[j] else 0.0
+        sim_r = _ratio_palabras(res_words[i], res_words[j], SIMILARITY_THRESHOLD_RESUMEN)
+        if sim_r < SIMILARITY_THRESHOLD_RESUMEN and res_pref[i] and res_pref[i] == res_pref[j]:
+            # identical opening sentence still counts as the same resumen
+            sim_r = max(sim_r, 0.90)
         semantic = 0.0
-        if can_cos and embs[i] is not None and embs[j] is not None:
-            semantic = float(cosine_similarity(
-                np.asarray(embs[i]).reshape(1, -1),
-                np.asarray(embs[j]).reshape(1, -1),
-            )[0][0])
-        overlap = _overlap_distintivo(ctx_n[i] or texto_i, ctx_n[j] or texto_j)
+        if can_cos and unit[i] is not None and unit[j] is not None:
+            semantic = float(np.dot(unit[i], unit[j]))
+        overlap = _overlap(i, j)
         same_url = bool(url_n[i] and url_n[i] == url_n[j])
         mismo_hecho = (
             sim_t >= SIMILARITY_THRESHOLD_TITULOS
@@ -879,6 +948,55 @@ def _capitalizar(frase: str) -> str:
     return frase[0].upper() + frase[1:]
 
 
+_VERBOS_TITULAR = re.compile(
+    r"\b(presenta|presentan|presento|anuncia|anuncian|anuncio|destaca|destacan|"
+    r"confirma|confirman|confirmo|pide|piden|pidio|lanza|lanzan|lanzo|abre|abren|abrio|"
+    r"inaugura|inauguran|inauguro|entrega|entregan|entrego|reporta|reportan|reporto|"
+    r"advierte|advierten|advirtio|revela|revelan|revelo|asegura|aseguran|aseguro|"
+    r"afirma|afirman|afirmo|alerta|alertan|alerto|denuncia|denuncian|denuncio|"
+    r"rechaza|rechazan|rechazo|aprueba|aprueban|aprobo|firma|firman|firmo|"
+    r"recibe|reciben|recibio|celebra|celebran|celebro|invierte|invierten|invirtio|"
+    r"impulsa|impulsan|impulso|lidera|lideran|lidero|logra|logran|logro|"
+    r"busca|buscan|busco|explica|explican|explico|analiza|analizan|analizo|"
+    r"promueve|promueven|promovio|realiza|realizan|realizo|ofrece|ofrecen|ofrecio|"
+    r"suspende|suspenden|suspendio|cierra|cierran|cerro|activa|activan|activo|"
+    r"refuerza|refuerzan|reforzo|amplia|amplian|amplio|reduce|reducen|redujo)\b"
+)
+
+_DROP_LEAD = {"otro", "otra", "otros", "otras", "este", "esta", "estos", "estas",
+              "nuevo", "nueva", "nuevos", "nuevas", "asi", "hoy", "ayer", "ahora"}
+
+
+def _limpiar_titular(titulo: str) -> str:
+    t = re.sub(r"<[^>]+>", " ", str(titulo or ""))
+    t = re.sub(r"^\s*(video|en vivo|audio|streaming|podcast|galeria|galería|fotos?)\s*[\|:\-–—]\s*",
+               "", t, flags=re.I)
+    t = t.split("|")[-1] if "|" in t else t
+    return re.sub(r"\s+", " ", t).strip(" .:;-–—")
+
+
+def _objeto_tras_verbo(titulo: str) -> str:
+    """'Alcalde presenta balance de seguridad en Cali' → 'Balance de seguridad en Cali'."""
+    limpio = _limpiar_titular(titulo)
+    if not limpio:
+        return ""
+    plano = unidecode(limpio.lower())
+    m = _VERBOS_TITULAR.search(plano)
+    if not m:
+        return ""
+    # Map match offset back to the original (unidecode keeps 1:1 length for these chars).
+    resto = limpio[m.end():].strip(" ,.:;")
+    resto = re.split(r"[\.\?\!¿¡]|\s[-–—]\s|:\s", resto)[0].strip()
+    words = resto.split()
+    while words and unidecode(words[0].lower()) in _DROP_LEAD | {"que", "a", "al", "el", "la", "los", "las", "un", "una", "unos", "unas", "su", "sus"}:
+        words.pop(0)
+    words = words[:MAX_PALABRAS_SUBTEMA]
+    while words and unidecode(words[-1].lower().rstrip(".,;:")) in _TRAILING_INCOMPLETE | _QUESTION_TAILS | _DROP_LEAD:
+        words.pop()
+    frase = _capitalizar(" ".join(words))
+    return frase if validar_subtema(frase) else ""
+
+
 def fallback_subtema(contexto: str, titulo: str = "") -> str:
     """
     Deterministic grammatical noun phrase from a parsed sentence.
@@ -887,7 +1005,10 @@ def fallback_subtema(contexto: str, titulo: str = "") -> str:
     texto = " ".join(x for x in (contexto, titulo) if x).strip()
     norm = _norm_text(texto)
     sent = re.split(r"(?<=[\.\!\?])\s+", texto.strip())[0] if texto.strip() else ""
-    sent_l = unidecode(sent.lower())
+
+    desde_titular = _objeto_tras_verbo(titulo) or _objeto_tras_verbo(sent)
+    if desde_titular:
+        return desde_titular
 
     if re.search(r"\b(terremoto|sismo|temblor)\b", norm) and re.search(
         r"\b(victima|victimas|muerto|muertos|herido|heridos|asciend)", norm
@@ -906,11 +1027,11 @@ def fallback_subtema(contexto: str, titulo: str = "") -> str:
             return "Resultados de la jornada deportiva"
         return "Cobertura deportiva de Diporto"
 
-    # Noun-phrase from first sentence: drop channel prefixes and verbs.
-    raw = re.sub(r"^(video|en vivo|audio|streaming)\s*[\|:\-–—]\s*", "", sent, flags=re.I)
-    raw = re.sub(r"<[^>]+>", "", raw)
+    # Noun-phrase from the headline (or first sentence): drop channel
+    # prefixes, verbs and filler leads before composing "X de Y".
+    raw = _limpiar_titular(titulo) or _limpiar_titular(sent)
     toks = [t for t in re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]+", raw) if t]
-    drop = STOPWORDS_ES | _CHANNEL_PREFIXES | _CONJUGATED_TAILS | _QUESTION_TAILS
+    drop = STOPWORDS_ES | _CHANNEL_PREFIXES | _CONJUGATED_TAILS | _QUESTION_TAILS | _DROP_LEAD
     kept = []
     for t in toks:
         tl = unidecode(t.lower())
@@ -1022,8 +1143,8 @@ def clasificar_lotes(
         return results
 
     aliases_str = ", ".join(_lista_alias(marca, aliases)[1:6])
-    for start in range(0, len(pending), batch_size):
-        chunk_idx = pending[start:start + batch_size]
+
+    def _run_batch(chunk_idx: List[int]) -> None:
         payload = []
         for i in chunk_idx:
             it = items[i]
@@ -1051,8 +1172,9 @@ def clasificar_lotes(
             f"ÍTEMS:\n{json.dumps(payload, ensure_ascii=False)}"
         )
         if call_counter:
-            call_counter.chat += 1
-            call_counter.chat_items += len(chunk_idx)
+            with _COUNTER_LOCK:
+                call_counter.chat += 1
+                call_counter.chat_items += len(chunk_idx)
         try:
             raw = chat_fn(prompt)
             data = _parse_chat_payload(raw)
@@ -1085,6 +1207,17 @@ def clasificar_lotes(
                     results[i]["tema"] = fallback_tema(
                         results[i]["subtema"], items[i].get("contexto", "")
                     )
+
+    chunks = [pending[s:s + batch_size] for s in range(0, len(pending), batch_size)]
+    workers = max(1, min(CHAT_PARALLEL_BATCHES, len(chunks)))
+    if workers == 1:
+        for ch in chunks:
+            _run_batch(ch)
+    else:
+        # Bounded concurrency: a handful of batches in flight, never one
+        # request per news item and never an unbounded retry storm.
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(_run_batch, chunks))
     return results
 
 
@@ -1098,13 +1231,14 @@ def _mejor_representante(idxs: Sequence[int], contextos: Sequence[str],
         return 0
     con = [i for i in idxs if str(contextos[i] or "").strip()]
     pool = con or list(idxs)
-    if embeddings is not None and cosine_similarity is not None:
+    if embeddings is not None:
         vecs = [(i, embeddings[i]) for i in pool if embeddings[i] is not None]
         if len(vecs) >= 2:
-            M = np.array([v for _, v in vecs])
-            centro = np.mean(M, axis=0, keepdims=True)
-            best = int(np.argmax(cosine_similarity(M, centro)))
-            return vecs[best][0]
+            M = np.array([np.asarray(v, dtype=float).ravel() for _, v in vecs])
+            centro = M.mean(axis=0)
+            norms = np.linalg.norm(M, axis=1) * (np.linalg.norm(centro) or 1.0)
+            sims = (M @ centro) / np.where(norms == 0, 1.0, norms)
+            return vecs[int(np.argmax(sims))][0]
     return max(pool, key=lambda i: len(str(contextos[i] or "")))
 
 
@@ -1118,6 +1252,7 @@ def process_pipeline(
     pkl_tono_fn: Optional[Callable] = None,
     pkl_tema_fn: Optional[Callable] = None,
     progress: Optional[ProgressTracker] = None,
+    on_stage: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Tuple[List[Dict[str, Any]], ProgressTracker]:
     """
     Canonical API_JC path:
@@ -1126,7 +1261,9 @@ def process_pipeline(
     Duplicates are decided before the LLM and keep Tono IA = Duplicada.
     """
     km = km or KEYMAP
-    progress = progress or ProgressTracker()
+    progress = progress or ProgressTracker(on_stage=on_stage)
+    if on_stage is not None and progress.on_stage is None:
+        progress.on_stage = on_stage
     out = [dict(r) for r in rows]
     progress.stage("Limpieza", f"{len(out)} filas")
 

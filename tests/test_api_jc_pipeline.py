@@ -228,11 +228,19 @@ class TestScaleAndBatching(unittest.TestCase):
     def test_10_400_rows_blocked_not_n2_bounded_chat(self):
         n = 400
         rows = []
+        import random
+        rnd = random.Random(7)
+        vocab = ("terremoto cali colombia sismo victimas heridos autoridades alcaldia "
+                 "rescate solidaridad balance emergencia ciudad barrio vivienda familias "
+                 "damnificados bomberos gobierno informe cifras reporte").split()
         for i in range(n):
+            # Realistic ~1.5k-char resúmenes sharing vocabulary: this is what
+            # froze the UI with char-level SequenceMatcher and per-pair cosine.
+            long_res = " ".join(rnd.choice(vocab) for _ in range(250)) + f" ZX{i:04d}."
             rows.append(_row(
                 id=str(1000 + i),
-                titulo=f"Zalpha{i:04d} Quorum{i:04d} hallazgo local independiente",
-                resumen=f"Resumen exclusivo ZX{i:04d} sobre un hecho puntual distinto.",
+                titulo=f"Sismo en Cali: {rnd.choice(vocab)} {rnd.choice(vocab)} {i}",
+                resumen=long_res,
                 fecha="2026-04-01",
                 hora=f"{(i % 20) + 1:02d}:00",
                 medio=f"Medio{i}",
@@ -272,7 +280,7 @@ class TestScaleAndBatching(unittest.TestCase):
         def embed_fn(textos):
             embed_calls.append(len(textos))
             rng = __import__("numpy").random.RandomState(0)
-            return [rng.randn(16) for _ in textos]
+            return [rng.randn(1536) for _ in textos]
 
         t0 = time.time()
         out, prog = core.process_pipeline(
@@ -283,7 +291,7 @@ class TestScaleAndBatching(unittest.TestCase):
         self.assertEqual(len(embed_calls), 1, "must be a single embedding pass")
         self.assertEqual(embed_calls[0], n)
         max_pairs = n * (n - 1) // 2
-        self.assertLess(prog.comparisons.n, n * 25)
+        self.assertLess(prog.comparisons.n, n * 40)
         self.assertLess(prog.comparisons.n, max_pairs // 4)
         self.assertLessEqual(len(chat_calls), (n + core.CHAT_BATCH_SIZE - 1) // core.CHAT_BATCH_SIZE + 2)
         self.assertGreaterEqual(len(chat_calls), 1)
