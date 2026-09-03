@@ -19,6 +19,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.cluster import AgglomerativeClustering
 import json
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from typing import List, Dict, Tuple, Optional, Any
 import joblib
@@ -66,7 +67,7 @@ REQUEST_TIMEOUT_S            = _jc.REQUEST_TIMEOUT_S
 # ── Umbrales base (corpus grande ≥ 20 noticias) ──────────────────────────────
 UMBRAL_SUBTEMA = 0.78
 UMBRAL_TEMA    = 0.72
-NUM_TEMAS_MAX  = 15
+NUM_TEMAS_MAX  = 20  # reporte ≤ 20 categorías (taxonomía fija: 17 + 1 por defecto)
 
 UMBRAL_DEDUP_LABEL           = 0.86
 UMBRAL_FUSION_SUBTEMAS       = 0.88
@@ -1247,35 +1248,67 @@ def _unificar_subtemas_llm(subtemas_a_unificar, textos_por_subtema, marca, alias
         pass
     return None
 
-def get_embeddings_batch(textos, batch_size=100):
+EMBEDDING_BATCH_SIZE = 100
+EMBEDDING_PARALLEL   = 6
+
+def get_embeddings_batch(textos, batch_size=EMBEDDING_BATCH_SIZE):
     if not textos: return []
     cache = get_embedding_cache()
     resultados, missing = cache.get_many(textos)
     if not missing: return resultados
     mt = [textos[i][:2000] if textos[i] else "" for i in missing]
-    for i in range(0, len(mt), batch_size):
-        batch = mt[i:i + batch_size]
-        bidx = missing[i:i + batch_size]
+
+    def _sum_usage(resp):
+        u = resp.get('usage', {}) if isinstance(resp, dict) else getattr(resp, 'usage', {})
+        if u:
+            return (u.get('total_tokens') if isinstance(u, dict) else getattr(u, 'total_tokens', 0)) or 0
+        return 0
+
+    def _fetch(bidx, batch):
+        """Embed one batch (or each item of it) and return (pos, emb) pairs."""
+        out, tok = [], 0
         try:
-            resp = call_with_retries(openai.Embedding.create, input=batch, model=OPENAI_MODEL_EMBEDDING)
-            u = resp.get('usage', {}) if isinstance(resp, dict) else getattr(resp, 'usage', {})
-            if u:
-                st.session_state['tokens_embedding'] += (u.get('total_tokens') if isinstance(u, dict) else getattr(u, 'total_tokens', 0)) or 0
+            resp = call_with_retries(
+                openai.Embedding.create, input=batch, model=OPENAI_MODEL_EMBEDDING,
+                request_timeout=REQUEST_TIMEOUT_S,
+            )
+            tok += _sum_usage(resp)
             for j, d in enumerate(resp["data"]):
-                oi = bidx[j]
-                emb = d["embedding"]
+                if j < len(bidx):
+                    out.append((bidx[j], d["embedding"]))
+            return out, tok
+        except Exception:
+            pass
+        # Whole-batch failure → try each item alone so one bad text cannot
+        # kill the batch (same guarantee the sequential version had).
+        for j, t in enumerate(batch):
+            oi = bidx[j]
+            try:
+                r = openai.Embedding.create(
+                    input=[t], model=OPENAI_MODEL_EMBEDDING,
+                    request_timeout=REQUEST_TIMEOUT_S,
+                )
+                tok += _sum_usage(r)
+                out.append((oi, r["data"][0]["embedding"]))
+            except Exception:
+                pass
+        return out, tok
+
+    chunks = [(missing[s:s + batch_size], mt[s:s + batch_size])
+              for s in range(0, len(mt), batch_size)]
+    total_tokens = 0
+    with ThreadPoolExecutor(max_workers=min(EMBEDDING_PARALLEL, len(chunks))) as ex:
+        futures = [ex.submit(_fetch, bidx, batch) for bidx, batch in chunks]
+        for f in futures:
+            try:
+                out, tok = f.result()
+            except Exception:
+                out, tok = [], 0
+            total_tokens += tok
+            for oi, emb in out:
                 resultados[oi] = emb
                 cache.put(textos[oi], emb)
-        except:
-            for j, t in enumerate(batch):
-                oi = bidx[j]
-                try:
-                    r = openai.Embedding.create(input=[t], model=OPENAI_MODEL_EMBEDDING)
-                    emb = r["data"][0]["embedding"]
-                    resultados[oi] = emb
-                    cache.put(textos[oi], emb)
-                except:
-                    pass
+    st.session_state['tokens_embedding'] += total_tokens
     return resultados
 
 class DSU:
