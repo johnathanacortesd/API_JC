@@ -37,8 +37,12 @@ _COUNTER_LOCK = threading.Lock()
 OPENAI_MODEL_EMBEDDING = "text-embedding-3-small"
 OPENAI_MODEL_CLASIFICACION = "gpt-4.1-nano-2025-04-14"
 CHAT_BATCH_SIZE = 30
-CHAT_PARALLEL_BATCHES = 4
-REQUEST_TIMEOUT_S = 25
+CHAT_PARALLEL_BATCHES = 6
+# A 30-item classification request with ~1 KB of context per item plus a
+# 100-item embedding batch can legitimately take 40–90 s server-side.
+# 25 s made both paths time out and retry (×3 with backoff), which is what
+# made large dossiers feel stuck.
+REQUEST_TIMEOUT_S = 120
 MAX_RETRIES = 2
 MAX_BUCKET = 48
 MAX_EXACT_BUCKET = 20
@@ -57,7 +61,6 @@ CUERPO_SCAN_CHARS = 8000
 MAX_PALABRAS_SUBTEMA = 6
 MIN_PALABRAS_SUBTEMA = 3
 MAX_PALABRAS_TEMA = 5
-MAX_TEMAS = 20
 
 OUTPUT_COLUMNS = [
     "ID Noticia",
@@ -665,22 +668,28 @@ def _mencion_key(row: Dict[str, Any], km: Dict[str, str]) -> str:
 def detectar_duplicados(rows: Sequence[Dict[str, Any]],
                         km: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
     """
-    Duplicate = same publication, decided before any LLM call.
+    Duplicate = exact same publication, decided before any LLM call. The
+    rules are strict and match the client spec; title equality alone NEVER
+    marks a duplicate (that is Grupo noticia's job):
 
-    - Radio / Televisión: same `Menciones - Empresa` AND same Medio AND same
-      Hora. Fecha is also part of the slot: the same 07:00 on another day is
-      a different emission.
-    - Any other type (Internet, prensa, …): same `Menciones - Empresa` AND
-      same URL in `Link Nota`. Title equal/different does not matter.
-    - If either half is missing, it is NOT a duplicate — even with the same
-      title. `Link (Streaming - Imagen)` alone is not a duplicate key.
+    1. Internet / Prensa / Revistas (and any non-AV row): duplicate ONLY if
+       the same normalized article URL AND the same `Menciones - Empresa`.
+       The article URL is the embedded hyperlink of `Link Nota`;
+       `Link (Streaming - Imagen)` is consulted only when both rows have no
+       Link Nota (some imports carry the article URL in that field). Same
+       title with a different URL is NOT a duplicate.
+    2. Radio / Televisión: duplicate ONLY if the same `Menciones - Empresa`
+       AND the same `Medio` AND the same `Hora` (same broadcast slot).
+       Fecha is deliberately NOT part of the key and a shared clip/link URL
+       alone is NOT enough (client rule: "de resto no").
 
-    Similar titles alone never mark a duplicate; that is Grupo noticia.
+    Mención is part of every key so the dossier expansion (one row per
+    company) never marks two companies of the same note as duplicates.
     """
     km = km or KEYMAP
     processed = deepcopy(list(rows))
     seen_url: Dict[Tuple[str, str], int] = {}
-    seen_bcast: Dict[Tuple[str, str, str, str], int] = {}
+    seen_bcast: Dict[Tuple[str, str, str], int] = {}
 
     def _marcar(row: Dict[str, Any], orig_idx: int) -> None:
         orig = processed[orig_idx]
@@ -697,28 +706,39 @@ def detectar_duplicados(rows: Sequence[Dict[str, Any]],
             continue
         tipo = normalizar_tipo_medio(row.get(km.get("tipodemedio", "Tipo de Medio"), ""))
         mencion = _mencion_key(row, km)
+        if not mencion:
+            # Without a company mention there is no way to say the SAME
+            # note was logged twice for the same company.
+            continue
 
         if tipo in ("Radio", "Televisión"):
             medio = _norm_text(row.get(km.get("medio", "Medio"), ""))
-            fecha = normalizar_fecha(row.get(km.get("fecha", "Fecha"), ""))
             hora = normalizar_hora(row.get(km.get("hora", "Hora"), ""))
             if not (medio and hora):
                 continue
-            slot = (mencion, medio, fecha, hora)
+            slot = (mencion, medio, hora)
             if slot in seen_bcast:
                 _marcar(row, seen_bcast[slot])
             else:
                 seen_bcast[slot] = i
             continue
 
-        url = normalize_url(url_de_celda_link(row.get(km.get("link_nota", "Link Nota"))))
-        if not url:
-            continue
-        key = (url, mencion)
-        if key in seen_url:
-            _marcar(row, seen_url[key])
-        else:
-            seen_url[key] = i
+        # Internet / Prensa / Revistas / Otro: article URL + mención.
+        link_nota = normalize_url(url_de_celda_link(row.get(km.get("link_nota", "Link Nota"))))
+        streaming = normalize_url(url_de_celda_link(row.get(km.get("link_streaming", "Link (Streaming - Imagen)"))))
+        if link_nota:
+            key = (link_nota, mencion)
+            if key in seen_url:
+                _marcar(row, seen_url[key])
+            else:
+                seen_url[key] = i
+        elif streaming:
+            key = (streaming, mencion)
+            if key in seen_url:
+                _marcar(row, seen_url[key])
+            else:
+                seen_url[key] = i
+        # No URL at all → nothing to compare, never a duplicate.
     return processed
 
 
@@ -809,24 +829,36 @@ def extraer_contexto_analizado(titulo: Any, resumen: Any, marca: str,
                                aliases=None, cuerpo: Any = "",
                                _matcher=None) -> Dict[str, str]:
     """
-    Local context only: Título + Resumen - Aclaracion. No LLM/API.
-    `cuerpo` is accepted for caller compatibility and ignored.
+    Coherent Colombian-Spanish paragraph from brand mention windows.
+    Título + Resumen first; Cuerpo Completo only if needed.
     Fallback: Resumen, then full Título. Never mutates the original title cell.
     """
     tit = "" if titulo is None else str(titulo)
     res = "" if resumen is None else str(resumen)
+    cue = "" if cuerpo is None else str(cuerpo)
     compiled = _matcher if _matcher is not None else _compile_alias_matcher(marca, aliases)
     tit_n = _norm_text(tit)
     res_n = _norm_text(res)
     title_hit = _menciona_compiled(tit_n, compiled)
     res_hit = _menciona_compiled(res_n, compiled)
+    # Cuerpo Completo is only a fallback. Scanning 410 long bodies with
+    # unidecode+regex was ~6s of the pipeline; skip it when the brand
+    # already appears in Título or Resumen.
+    cue_n = ""
+    if cue and not (title_hit or res_hit):
+        cue_n = _norm_text(cue[:CUERPO_SCAN_CHARS])
+        cue_hit = _menciona_compiled(cue_n, compiled)
+    else:
+        cue_hit = False
 
     coincidencia = ""
     for n, kn, pat, _toks in compiled:
-        if kn and (pat.search(tit_n) or pat.search(res_n)):
+        if (kn and (
+            pat.search(tit_n) or pat.search(res_n) or (cue_n and pat.search(cue_n))
+        )):
             coincidencia = n
             break
-    if not coincidencia and (title_hit or res_hit):
+    if not coincidencia and (title_hit or res_hit or cue_hit):
         coincidencia = marca or ""
 
     origen_parts = []
@@ -834,6 +866,8 @@ def extraer_contexto_analizado(titulo: Any, resumen: Any, marca: str,
         origen_parts.append("Título")
     if res_hit:
         origen_parts.append("Resumen")
+    if cue_hit and not (title_hit or res_hit):
+        origen_parts.append("Cuerpo Completo")
     origen = ", ".join(origen_parts)
 
     bloques: List[str] = []
@@ -845,6 +879,8 @@ def extraer_contexto_analizado(titulo: Any, resumen: Any, marca: str,
                 bloques.append(tit.strip())
             if res_hit:
                 bloques.append(res.strip())
+    elif cue_hit:
+        bloques.extend(_ventanas_mencion_compiled(cue[:CUERPO_SCAN_CHARS], cue_n, compiled)[:3])
     else:
         if res.strip():
             bloques.append(res.strip())
@@ -1497,34 +1533,22 @@ def fallback_subtema(contexto: str, titulo: str = "") -> str:
         if validar_subtema(frase):
             return _capitalizar(frase)
 
-    # 5) Last resort: entity + generic coverage. Never scrape a context blurb.
+    # 5) Last resort: entity coverage or thematic umbrella. NEVER join the
+    # first bare keywords with 'de' ('Tecnología de innovación de obras'):
+    # that keyword collage is exactly what the client rejects.
     ent = _entidad_inicial(titulo)
     if ent and len(ent.split()) <= 3:
         frase = f"Cobertura sobre {ent}"
         if validar_subtema(frase):
             return _capitalizar(frase)
-    raw = _limpiar_titular(titulo) or _limpiar_titular(re.split(r"(?<=[\.\!\?])\s+", (contexto or "").strip())[0] if contexto else "")
-    toks = [t for t in re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]+", raw) if t]
-    drop = STOPWORDS_ES | _CHANNEL_PREFIXES | _CONJUGATED_TAILS | _QUESTION_TAILS | _DROP_LEAD
-    kept = []
-    for t in toks:
-        tl = unidecode(t.lower())
-        if tl in drop or tl in _CONJUGATED_TAILS or re.search(r"\d", tl):
-            continue
-        if len(tl) < 3:
-            continue
-        kept.append(t)
-        if len(kept) >= 3:
-            break
-    if len(kept) >= 2:
-        frase = f"{kept[0]} de {' '.join(kept[1:3])}" if len(kept) >= 3 else f"{kept[0]} de {kept[1]}"
-        frase = _capitalizar(" ".join(_recortar_sintagma(frase.split(), MAX_PALABRAS_SUBTEMA)))
+    # 6) Thematic umbrella from the fixed taxonomy of headline + context, so
+    # even the last resort names the actual issue ('Cobertura de salud
+    # pública') instead of gluing headline words with 'de'.
+    tema_fb = tema_por_taxonomia("", titulo, contexto)
+    if tema_fb and validar_tema(tema_fb):
+        frase = _capitalizar(f"Cobertura de {tema_fb.lower()}")
         if validar_subtema(frase):
             return frase
-    if kept:
-        frase = f"Cobertura sobre {kept[0].lower()}"
-        if validar_subtema(frase):
-            return _capitalizar(frase)
     return "Cobertura de información relevante"
 
 
@@ -1561,6 +1585,7 @@ TAXONOMIA_TEMAS: Dict[str, Tuple[str, ...]] = {
     "Empleo y trabajo": (
         "empleo", "trabajador", "sindicato", "salario", "desempleo", "paro", "huelga",
         "laboral", "contratacion", "despido", "jornada laboral", "pension",
+        "pensionado", "pensionados", "mesada", "mesadas", "jubilacion", "jubilaciones",
     ),
     "Infraestructura y movilidad": (
         "via", "vias", "carretera", "movilidad", "transporte", "obra", "puente",
@@ -1598,7 +1623,7 @@ TAXONOMIA_TEMAS: Dict[str, Tuple[str, ...]] = {
         "biodiversidad", "residuos", "basuras", "arbol", "mineria ilegal", "emisiones",
     ),
     "Servicios públicos": (
-        "energia", "acueducto", "alcantarillado", "tarifa", "luz", "gas", "internet",
+        "energia", "acueducto", "alcantarillado", "tarifa", "tarifas", "luz", "gas", "internet",
         "emcali", "epm", "corte de agua", "cortes de agua", "corte del servicio",
         "suspension del servicio", "racionamiento", "apagon", "factura",
         "servicio publico", "servicios publicos", "aseo", "recoleccion de basuras",
@@ -1656,97 +1681,11 @@ def tema_por_taxonomia(subtema: str, contexto: str = "", titulo: str = "") -> st
     return mejor[0] if mejor[1] >= 2 else ""
 
 
-def _nombre_tema_desde_subtema(subtema: str) -> str:
-    """Broader label derived from an already-generated subtema (not a prior taxonomy)."""
-    words = _palabras(subtema)
-    if not words:
-        return ""
-    for k in range(min(MAX_PALABRAS_TEMA, len(words)), 1, -1):
-        cand = _capitalizar(" ".join(words[:k]))
-        if validar_tema(cand):
-            return cand
-    if len(words) >= 2:
-        cand = _capitalizar(f"{words[0]} de {words[-1]}")
-        if validar_tema(cand):
-            return cand
-    return ""
-
-
 def fallback_tema(subtema: str, contexto: str = "", titulo: str = "") -> str:
-    """Tema comes from the subtema phrase. Taxonomy is not assigned first."""
-    tema = _nombre_tema_desde_subtema(subtema)
+    tema = tema_por_taxonomia(subtema, contexto, titulo)
     if tema and validar_tema(tema):
         return tema
     return TEMA_POR_DEFECTO
-
-
-def temas_desde_subtemas(labels: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Group already-generated subtemas into at most MAX_TEMAS categories."""
-    if not labels:
-        return labels
-    unique: List[str] = []
-    index_of: Dict[str, int] = {}
-    members: Dict[int, List[str]] = defaultdict(list)
-    for lab in labels:
-        sub = str(lab.get("subtema") or "").strip()
-        if not sub or sub == "-":
-            continue
-        key = _norm_text(sub)
-        if key not in index_of:
-            index_of[key] = len(unique)
-            unique.append(sub)
-        members[index_of[key]].append(sub)
-    n = len(unique)
-    if n == 0:
-        for lab in labels:
-            if not lab.get("tema") or not validar_tema(str(lab.get("tema") or "")):
-                lab["tema"] = TEMA_POR_DEFECTO
-        return labels
-
-    dsu = DSU(n)
-    stems = [_stems(_tokens_distintivos(s, min_len=3)) or _stems(_palabras(s)) for s in unique]
-    for i in range(n):
-        for j in range(i + 1, n):
-            if not stems[i] or not stems[j]:
-                continue
-            if _jaccard_sets(stems[i], stems[j]) >= 0.34 or _overlap_sets(stems[i], stems[j]) >= 0.50:
-                dsu.union(i, j)
-    clusters = dsu.grupos(n)
-
-    while len(clusters) > MAX_TEMAS:
-        keys = list(clusters)
-        unions = {k: set().union(*(stems[i] for i in clusters[k] if stems[i])) for k in keys}
-        best = None
-        for a_i, a in enumerate(keys):
-            for b in keys[a_i + 1:]:
-                sim = _jaccard_sets(unions[a], unions[b]) if unions[a] and unions[b] else -1.0
-                size = len(clusters[a]) + len(clusters[b])
-                cand = (sim, -size, a, b)
-                if best is None or cand > best:
-                    best = cand
-        if best is None:
-            break
-        dsu.union(best[2], best[3])
-        clusters = dsu.grupos(n)
-
-    tema_de_sub: Dict[str, str] = {}
-    for idxs in clusters.values():
-        subs = [unique[i] for i in idxs]
-        freq: Counter = Counter()
-        for i in idxs:
-            freq.update(members[i])
-        nombre = _nombre_tema_desde_subtema(freq.most_common(1)[0][0] if freq else subs[0])
-        if not nombre or not validar_tema(nombre):
-            nombre = fallback_tema(subs[0])
-        for sub in subs:
-            tema_de_sub[_norm_text(sub)] = nombre
-
-    for lab in labels:
-        sub = str(lab.get("subtema") or "").strip()
-        if not sub or sub == "-":
-            continue
-        lab["tema"] = tema_de_sub.get(_norm_text(sub)) or fallback_tema(sub)
-    return labels
 
 
 def _recortar_sintagma(words: List[str], max_palabras: int) -> List[str]:
@@ -1824,9 +1763,11 @@ def clasificar_lotes(
     call_counter: Optional[CallCounter] = None,
 ) -> List[Dict[str, str]]:
     """
-    One JSON ChatCompletion per 25–40 items. Context is already local.
-    Order: sentiment toward the brand, then subtema. Temas are grouped
-    later from those subtemas (max MAX_TEMAS).
+    One JSON ChatCompletion per 25–40 items. Never one call per news/group
+    unless a single leftover batch remains. Heuristic first; LLM only when
+    the noun phrase cannot be formed grammatically. The model returns
+    tono + subtema (tema is NOT requested: it is derived later from the
+    consolidated subtema against the fixed ≤20-category taxonomy).
     """
     results: List[Dict[str, str]] = [{"tono": "Neutro", "tema": "", "subtema": ""} for _ in items]
     pending: List[int] = []
@@ -1838,12 +1779,19 @@ def clasificar_lotes(
         results[i]["subtema"] = sub
         results[i]["tono"] = it.get("tono") or "Neutro"
         if chat_fn is not None:
+            # Every representative goes to the batch: tone is model-based and
+            # the model's labels replace the heuristic ones when they validate.
             pending.append(i)
 
     if chat_fn is None or not pending:
-        return temas_desde_subtemas(results)
+        return results
 
     aliases_str = ", ".join(_lista_alias(marca, aliases)[1:6])
+    # Model-side only: an ungrammatical fragment reaches the sheet only if
+    # both the model and the deterministic fallback fail the validator.
+    # Tema is NOT requested from the model anymore: it is derived from the
+    # consolidated subtema against the fixed ≤20-category taxonomy, which is
+    # the exact "subtemas → temas (≤20)" flow the client asked for.
     rejected: Dict[int, List[str]] = defaultdict(list)
 
     def _prompt(payload: List[Dict[str, Any]], reparacion: bool) -> str:
@@ -1851,44 +1799,47 @@ def clasificar_lotes(
             f"Eres un analista senior de medios en Colombia. Marca analizada: '{marca}'"
             + (f" (alias: {aliases_str})" if aliases_str else "")
             + ".\nPara cada ítem el campo 'titulo' nombra el HECHO de la noticia y 'contexto' es el "
-            "párrafo de mención de la marca extraído localmente de Título + Resumen "
-            "(si no hay mención, es resumen o título). El subtema debe reflejar el hecho del TÍTULO.\n"
+            "párrafo en el que se menciona a la marca (si la marca no aparece, es el resumen o el título). "
+            "El subtema debe reflejar el hecho del TÍTULO, no un detalle técnico del contexto.\n"
         )
         formato = (
             "Devuelve SOLO JSON: {\"items\":[{\"id\":0,\"tono\":\"Positivo|Negativo|Neutro\","
             "\"subtema\":\"...\"}]}\n"
         )
         reglas = (
-            "Orden: primero TONO (sentimiento hacia la marca/alias en ese contexto), "
-            "después SUBTEMA. No inventes un tema: se agrupa después a partir de los subtemas.\n"
-            "TONO: impacto reputacional DIRECTO sobre la marca (no el tono general de la noticia). "
-            "Positivo si la marca logra, gana, aporta, es reconocida; Negativo si es cuestionada, "
-            "sancionada, afectada o responsable de un daño; Neutro si solo se menciona o el hecho "
-            "no cambia su imagen.\n"
-            "SUBTEMA (3 a 6 palabras, máximo 6): frase nominal COMPLETA en español de Colombia. "
-            "Núcleo sustantivo + complemento con de/del/en/para/sobre/ante/por. Sin comas. "
+            "SUBTEMA (3 a 6 palabras, máximo 6): encabezado de reporte que dice DE QUÉ TRATÓ la "
+            "noticia, frase nominal COMPLETA en español de Colombia, "
+            "núcleo sustantivo + complemento con de/del/en/para/sobre/ante/por. Sin comas. "
             "No termine en número, cifra, millón(es), signo $, preposición ni artículo. "
-            "PROHIBIDO: collage de palabras clave, verbo+'de' ('Agenda tendrá'), "
-            "recortar el titular, copiar el objeto de un verbo ('Netflix por US$587 millones'), "
-            "detalles de producto, partícipios colgados, verbos conjugados, colas interrogativas, "
-            "prefijos de canal.\n"
+            "Usa el TÍTULO para nombrar el hecho; el contexto solo aclara. "
+            "PROHIBIDO: recortar el titular, copiar el objeto de un verbo ('Netflix por US$587 millones'), "
+            "detalles de producto ('Múltiples y escalables a todas las fases de producción'), "
+            "partícipios colgados ('Destacada entre las sociólogas… dentro'), verbos conjugados, "
+            "colas interrogativas, prefijos de canal, y PROHIBIDO unir palabras sueltas con 'de' "
+            "('Tecnología de innovación de obras', 'Aumento de tarifas de servicios').\n"
             "  Correcto: 'Adquisición de InterPositive por Netflix', "
             "'Solidaridad de caleños en rescate', "
             "'Inversión en vías del Cauca'.\n"
-            "  Incorrecto: 'Agenda tendrá', 'Balance seguridad', "
-            "'Netflix por US$587 millones', "
-            "'Diporto resultados jornada fecha liga'.\n"
+            "  Incorrecto: 'Netflix por US$587 millones', "
+            "'Múltiples y escalables a todas las fases de producción', "
+            "'Destacada entre las sociólogas más influyentes del país dentro', "
+            "'Terremoto en colombia ascienden'.\n"
+            "TONO: impacto reputacional DIRECTO sobre la marca o sus alias (no el tono general de la noticia). "
+            "Positivo si la marca logra, gana, aporta, es reconocida; Negativo si es cuestionada, "
+            "sancionada, afectada o responsable de un daño; Neutro si NO se menciona la marca, "
+            "si solo se menciona de paso sin rol, o si el hecho no cambia su imagen.\n"
         )
         extra = ""
         if reparacion:
             extra = (
-                "REPARACIÓN: estas etiquetas fueron RECHAZADAS por incompletas, cortadas o "
-                "por ser una unión de palabras clave. Redacta de nuevo el SUBTEMA como frase "
-                "nominal completa; el campo 'rechazadas' muestra lo que NO debes repetir.\n"
+                "REPARACIÓN: el subtema de estos ítems fue RECHAZADO por incompleto, cortado o "
+                "por ser una unión de palabras clave con 'de'. Redacta de nuevo SOLO el subtema como "
+                "frase nominal completa basada en el título; el campo 'rechazadas' muestra lo que NO debes repetir.\n"
             )
         return cabecera + formato + reglas + extra + f"ÍTEMS:\n{json.dumps(payload, ensure_ascii=False)}"
 
     def _aplicar(i: int, row: Dict[str, Any]) -> bool:
+        it = items[i]
         tono = str(row.get("tono") or results[i]["tono"]).strip().title()
         if tono not in ("Positivo", "Negativo", "Neutro"):
             tono = results[i]["tono"] if results[i]["tono"] in ("Positivo", "Negativo", "Neutro") else "Neutro"
@@ -1929,7 +1880,8 @@ def clasificar_lotes(
                 except Exception:
                     continue
             for i in chunk_idx:
-                if not _aplicar(i, by_id.get(i, {})):
+                ok_sub = _aplicar(i, by_id.get(i, {}))
+                if not ok_sub:
                     fallidos.append(i)
         except Exception:
             fallidos.extend(chunk_idx)
@@ -1955,17 +1907,117 @@ def clasificar_lotes(
     fallidos = _run_all(pending, reparacion=False)
     # One bounded repair round, still batched, only for rejected labels.
     if fallidos:
-        fallidos = _run_all(sorted(set(fallidos)), reparacion=True)
+        _run_all(sorted(set(fallidos)), reparacion=True)
     for i in range(len(items)):
+        ctx = str(items[i].get("contexto") or "")
+        tit = str(items[i].get("titulo") or "")
         if not validar_subtema(results[i]["subtema"]):
-            results[i]["subtema"] = fallback_subtema(items[i].get("contexto", ""), items[i].get("titulo", ""))
+            results[i]["subtema"] = fallback_subtema(ctx, tit)
+        if not validar_subtema(results[i]["subtema"]):
+            results[i]["subtema"] = "Cobertura de información relevante"
+        # Tema is always derived from the FINAL subtema against the fixed
+        # taxonomy: this is what guarantees ≤20 stable themes per report.
+        results[i]["tema"] = fallback_tema(results[i]["subtema"], ctx, tit)
+        results[i]["tema"] = _capitalizar(results[i]["tema"])
         results[i]["subtema"] = _capitalizar(results[i]["subtema"])
-    return temas_desde_subtemas(results)
+    return results
 
 
-def consolidar_temas_lote(labels: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Temas are grouped from the generated subtemas (max MAX_TEMAS)."""
-    return temas_desde_subtemas(labels)
+def consolidar_temas_lote(labels: List[Dict[str, str]],
+                          items: Optional[Sequence[Dict[str, Any]]] = None) -> List[Dict[str, str]]:
+    """Subtemas → Temas (≤20), per client spec.
+
+    1. Subtema canonicalization: near-identical subtema labels (same event
+       wording that two different Grupo-noticia groups produced) collapse to
+       the most frequent spelling, so "dos o más noticias iguales o
+       similares o que comparten patrones" end up with the SAME Subtema.
+       Merging is deliberately lexical (exact / near-exact wording, stem
+       equality, no opposite-action pairs): embedding-based glue was removed
+       because it merged distinct events that shared a paraphrase.
+    2. Tema: every canonical subtema maps to ONE theme of the fixed
+       taxonomy (17 categories + default = ≤18 ≤ 20). The taxonomy is the
+       20-category cap "con base en los subtemas generados".
+    """
+    if not labels:
+        return labels
+    n = len(labels)
+    subs = [str(l.get("subtema") or "") for l in labels]
+    normed = [_norm_text(s) for s in subs]
+
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(n):
+        a = normed[i]
+        if not a:
+            continue
+        for j in range(i + 1, n):
+            if find(i) == find(j):
+                continue
+            b = normed[j]
+            if not b:
+                continue
+            same = (a == b)
+            if not same and len(a) >= 6 and len(b) >= 6:
+                # Near-identical wording ('atencion de quejas de usuarios'
+                # vs 'atencion de quejas de usuario'), not concept-glue.
+                if _ratio(a, b) >= 0.96:
+                    same = True
+            if not same:
+                # Same content stems: plural/tense/typography variants only.
+                stems_a = _stems(a.split())
+                stems_b = _stems(b.split())
+                if stems_a and stems_a == stems_b:
+                    same = True
+            if same and not _hay_conflicto_accion(a, b):
+                union(i, j)
+
+    grupos = defaultdict(list)
+    for i in range(n):
+        grupos[find(i)].append(i)
+    freq = Counter(subs)
+    canon: Dict[int, str] = {}
+    for root, idxs in grupos.items():
+        vals = [subs[k] for k in idxs if subs[k]]
+        if not vals:
+            continue
+        canon[root] = max(vals, key=lambda s: (freq.get(s, 0), len(s)))
+
+    # Tema is per canonical subtema (one subtema ⇒ one tema), derived from
+    # the member whose contexto/título best represent the merged group.
+    tema_root: Dict[int, str] = {}
+    for root, idxs in grupos.items():
+        sub = canon.get(root, "")
+        if not sub:
+            continue
+        best = None
+        best_len = -1
+        for i in idxs:
+            if items is not None and i < len(items):
+                ctx = str(items[i].get("contexto") or "")
+                tit = str(items[i].get("titulo") or "")
+                score = len(ctx) + len(tit)
+                if score > best_len:
+                    best_len = score
+                    best = (ctx, tit)
+        ctx, tit = best if best is not None else ("", "")
+        tema_root[root] = _capitalizar(fallback_tema(sub, ctx, tit))
+
+    for i in range(n):
+        root = find(i)
+        labels[i]["subtema"] = _capitalizar(canon.get(root, subs[i]))
+        labels[i]["tema"] = tema_root.get(root, TEMA_POR_DEFECTO)
+    return labels
 
 
 # ---------------------------------------------------------------------------
@@ -2014,10 +2066,13 @@ def process_pipeline(
 ) -> Tuple[List[Dict[str, Any]], ProgressTracker]:
     """
     Canonical API_JC path:
-    Limpieza → Duplicados → Contexto (local, título+resumen, no API)
-    → Embedding único → Agrupación → Tono → Subtema → Temas from subtemas
-    (≤ MAX_TEMAS, cached by group) → Excel caller.
-    Duplicates are decided before the LLM and keep Tono IA = Duplicada.
+    Limpieza → Duplicados → Contexto → Embedding único → Agrupación
+    → Tono / Subtema (batched, one call per ~30 groups) → Subtemas
+    canónicos (misma etiqueta para noticias iguales/similares) → Tema de
+    taxonomía fija (≤20 categorías, derivado del subtema) → Excel caller.
+    Duplicates are decided before the LLM (misma URL + misma mención para
+    gráficas/Internet; misma mención + medio + hora para Radio/TV) and keep
+    Tono IA = Duplicada.
     """
     km = km or KEYMAP
     progress = progress or ProgressTracker(on_stage=on_stage)
@@ -2030,18 +2085,29 @@ def process_pipeline(
     n_dup = sum(1 for r in out if r.get("is_duplicate"))
     progress.stage("Duplicados", f"{n_dup} duplicadas")
 
-    titulos, resumenes = [], []
+    titulos, resumenes, cuerpos = [], [], []
     for r in out:
         tit = r.get("_titulo_original", r.get(km["titulo"], ""))
         r["_titulo_original"] = titulo_original(tit)
         r[km["titulo"]] = r["_titulo_original"]
         titulos.append(r["_titulo_original"])
         resumenes.append(r.get(km["resumen"], ""))
+        cuerpos.append(r.get(km.get("cuerpo", "Cuerpo Completo"), ""))
 
     matcher = _compile_alias_matcher(marca, aliases)
     for i, r in enumerate(out):
+        # A duplicate is the SAME publication: reuse the original's brand
+        # context instead of re-scanning its (identical) body.
+        if r.get("is_duplicate"):
+            o = r.get("_dup_of_index")
+            if isinstance(o, int) and 0 <= o < i:
+                src = out[o]
+                r["Contexto analizado"] = src.get("Contexto analizado", "")
+                r["Coincidencia marca"] = src.get("Coincidencia marca", "")
+                r["Origen coincidencia"] = src.get("Origen coincidencia", "")
+                continue
         meta = extraer_contexto_analizado(
-            titulos[i], resumenes[i], marca, aliases,
+            titulos[i], resumenes[i], marca, aliases, cuerpos[i],
             _matcher=matcher,
         )
         r["Contexto analizado"] = meta["contexto"]
@@ -2056,10 +2122,21 @@ def process_pipeline(
         for i in range(len(out))
     ]
     if embed_fn is not None:
-        embeddings = embed_fn(texts_emb)
+        # Embed each UNIQUE text once: duplicate rows and same-context
+        # republications share a vector, so big dossiers send far fewer
+        # embedding tokens to the API.
+        unique_idx: Dict[str, int] = {}
+        unique_texts: List[str] = []
+        for t in texts_emb:
+            if t not in unique_idx:
+                unique_idx[t] = len(unique_texts)
+                unique_texts.append(t)
+        emb_unique = embed_fn(unique_texts) if unique_texts else []
+        emb_by_text = dict(zip(unique_texts, emb_unique))
+        embeddings = [emb_by_text.get(t) for t in texts_emb]
         progress.calls.embed += 1
-        progress.calls.embed_items += len(texts_emb)
-    progress.stage("Embedding único", f"{len(texts_emb)} textos")
+        progress.calls.embed_items += len(unique_texts)
+    progress.stage("Embedding único", f"{len(unique_texts) if embeddings else len(texts_emb)} textos únicos")
 
     grupos = agrupar_noticias_bloqueado(
         titulos, resumenes, contextos, embeddings,
@@ -2103,6 +2180,10 @@ def process_pipeline(
         reps, marca, aliases, chat_fn=chat_fn,
         call_counter=progress.calls,
     )
+    # Canonical subtemas (same label for same/similar news) + tema from the
+    # ≤20-category taxonomy, derived per subtema with the rep's context.
+    labels = consolidar_temas_lote(labels, reps)
+    # User-supplied .pkl models override the taxonomy defaults when present.
     if pkl_tono_fn is not None:
         try:
             tonos = pkl_tono_fn([x["contexto"] for x in reps])
@@ -2121,7 +2202,6 @@ def process_pipeline(
         except Exception:
             pass
 
-    labels = consolidar_temas_lote(labels)
     by_gid = {gid: labels[k] for k, gid in enumerate(gid_of_rep)}
     progress.stage("Tono", f"{progress.calls.chat} llamadas chat")
     progress.stage("Tema/Subtema", f"{len(grupos)} grupos cacheados")
