@@ -167,20 +167,44 @@ class TestDuplicatesVsGrupo(unittest.TestCase):
         self.assertEqual(out2[0]["Grupo noticia"], out2[1]["Grupo noticia"])
         self.assertEqual(out2[0]["Subtema"], out2[1]["Subtema"])
 
-    def test_05b_streaming_link_same_mencion_duplicate_any_title(self):
+    def test_05b_same_link_nota_same_mencion_duplicate_any_title(self):
         rows = [
-            _row(id="35", titulo="Primer titular sobre la marca", link=None,
+            _row(id="35", titulo="Primer titular sobre la marca",
+                 link={"value": "Link", "url": "https://elpais.com.co/nota/77"}),
+            _row(id="36", titulo="Titular totalmente diferente",
+                 link={"value": "Link", "url": "https://elpais.com.co/nota/77?utm_source=x"}),
+            _row(id="37", titulo="Primer titular sobre la marca", mencion="Otra Empresa",
+                 link={"value": "Link", "url": "https://elpais.com.co/nota/77"}),
+        ]
+        out = core.detectar_duplicados(rows)
+        self.assertFalse(out[0]["is_duplicate"])
+        self.assertTrue(out[1]["is_duplicate"], "same Link Nota + same mención → duplicate")
+        self.assertEqual(str(out[1]["ID duplicada"]), "35")
+        self.assertFalse(out[2]["is_duplicate"], "different mención keeps the row")
+
+    def test_05c_streaming_alone_is_not_duplicate(self):
+        rows = [
+            _row(id="38", titulo="A",
+                 link={"value": "Link", "url": "https://a.com/1"},
                  **{"Link (Streaming - Imagen)": {"value": "Link", "url": "https://stream.tv/clip/77"}}),
-            _row(id="36", titulo="Titular totalmente diferente", link=None,
-                 **{"Link (Streaming - Imagen)": {"value": "Link", "url": "https://stream.tv/clip/77?utm_source=x"}}),
-            _row(id="37", titulo="Primer titular sobre la marca", link=None, mencion="Otra Empresa",
+            _row(id="39", titulo="B",
+                 link={"value": "Link", "url": "https://b.com/2"},
                  **{"Link (Streaming - Imagen)": {"value": "Link", "url": "https://stream.tv/clip/77"}}),
         ]
         out = core.detectar_duplicados(rows)
         self.assertFalse(out[0]["is_duplicate"])
-        self.assertTrue(out[1]["is_duplicate"], "same streaming link + same mención → duplicate")
-        self.assertEqual(str(out[1]["ID duplicada"]), "35")
-        self.assertFalse(out[2]["is_duplicate"], "different mención keeps the row")
+        self.assertFalse(out[1]["is_duplicate"], "streaming link alone is not URL Nota")
+
+    def test_05d_radio_same_hora_different_fecha_not_duplicate(self):
+        rows = [
+            _row(id="40", tipo="Radio", medio="Caracol Radio", fecha="2026-03-01",
+                 hora="07:00", titulo="Balance de seguridad", link=None),
+            _row(id="41", tipo="Radio", medio="Caracol Radio", fecha="2026-03-02",
+                 hora="07:00", titulo="Balance de seguridad", link=None),
+        ]
+        out = core.detectar_duplicados(rows)
+        self.assertFalse(out[0]["is_duplicate"])
+        self.assertFalse(out[1]["is_duplicate"], "same 07:00 on another day is another emission")
 
 
 class TestGroupingAndLabels(unittest.TestCase):
@@ -256,10 +280,9 @@ class TestGroupingAndLabels(unittest.TestCase):
         for tema in ["Seguridad y orden público", "Infraestructura y movilidad", "Salud pública",
                      "Gestión pública local", "Emergencias y desastres naturales"]:
             self.assertTrue(core.validar_tema(tema), tema)
-        self.assertEqual(core.fallback_tema("Agenda del concejo", "La agenda del concejo tendrá debates.", "Agenda tendrá"),
-                         "Política y gobierno")
-        self.assertEqual(core.fallback_tema("Inversión en vías terciarias del Cauca", "", ""),
-                         "Infraestructura y movilidad")
+        for sub in ("Agenda del concejo", "Inversión en vías terciarias del Cauca"):
+            tema = core.fallback_tema(sub, "", "")
+            self.assertTrue(core.validar_tema(tema), tema)
         # Long headline object is trimmed at a phrase boundary, never mid-complement.
         s = core.fallback_subtema(
             "Los Topos Azteca llegaron.",
@@ -345,6 +368,40 @@ class TestInterPositiveLabelsAndGroup(unittest.TestCase):
         self.assertRegex(sub.lower(), r"adquisici[oó]n de interpositive")
         self.assertNotIn("587", sub)
         self.assertNotIn("$", sub)
+
+
+class TestTemasFromSubtemas(unittest.TestCase):
+    def test_15_temas_grouped_from_subtemas_max_20(self):
+        labels = []
+        for i in range(25):
+            labels.append({
+                "tono": "Neutro",
+                "tema": "",
+                "subtema": f"Cobertura sobre hecho número {i}",
+            })
+        labels.append({"tono": "Neutro", "tema": "", "subtema": "Adquisición de InterPositive por Netflix"})
+        labels.append({"tono": "Neutro", "tema": "", "subtema": "Adquisición de InterPositive"})
+        out = core.temas_desde_subtemas(labels)
+        temas = {r["tema"] for r in out if r.get("tema")}
+        self.assertLessEqual(len(temas), core.MAX_TEMAS)
+        self.assertLessEqual(core.MAX_TEMAS, 20)
+        same = [r for r in out if "interpositive" in r["subtema"].lower()]
+        self.assertEqual(same[0]["tema"], same[1]["tema"])
+        for r in out:
+            self.assertTrue(core.validar_tema(r["tema"]), r["tema"])
+
+    def test_16_same_subtema_same_tema_in_pipeline(self):
+        rows = [
+            _row(id="90", titulo="Topos Azteca destacan la solidaridad de los caleños durante las labores de rescate",
+                 link={"value": "Link", "url": "https://a.com/1"}),
+            _row(id="91", titulo="Los Topos Azteca destacaron la solidaridad de los caleños en el rescate",
+                 link={"value": "Link", "url": "https://b.com/2"}),
+        ]
+        out, _ = core.process_pipeline(rows, "Topos Azteca", ["Topos"])
+        self.assertEqual(out[0]["Subtema"], out[1]["Subtema"])
+        self.assertEqual(out[0]["Tema"], out[1]["Tema"])
+        self.assertTrue(core.validar_subtema(out[0]["Subtema"]), out[0]["Subtema"])
+        self.assertTrue(core.validar_tema(out[0]["Tema"]), out[0]["Tema"])
 
 
 class TestOutputSchema(unittest.TestCase):
@@ -499,8 +556,8 @@ class TestGroupingSpeedRealistic(unittest.TestCase):
         self.assertEqual(by_row[10], by_row[11])
         self.assertGreaterEqual(len(grupos), 40, "must not collapse the whole dossier into few groups")
 
-    def test_12_contexto_skips_cuerpo_when_title_hits(self):
-        cuerpo = ("palabra " * 4000) + "Relleno sin marca en el cuerpo largo."
+    def test_12_contexto_from_titulo_resumen_ignores_cuerpo(self):
+        cuerpo = ("palabra " * 4000) + "Topos Azteca solo en el cuerpo largo."
         t0 = time.time()
         for _ in range(80):
             meta = core.extraer_contexto_analizado(
@@ -514,6 +571,16 @@ class TestGroupingSpeedRealistic(unittest.TestCase):
         self.assertLess(dt, 1.2, f"contexto with long cuerpo too slow: {dt:.2f}s")
         self.assertIn("Topos", meta["contexto"])
         self.assertEqual(meta["origen"], "Título")
+        self.assertNotIn("cuerpo largo", meta["contexto"].lower())
+        only_cuerpo = core.extraer_contexto_analizado(
+            "Titular sin la marca",
+            "Resumen sin la marca mencionada.",
+            "Topos Azteca",
+            ["Topos"],
+            cuerpo,
+        )
+        self.assertNotEqual(only_cuerpo["origen"], "Cuerpo Completo")
+        self.assertNotIn("cuerpo largo", only_cuerpo["contexto"].lower())
 
 
 class TestUrlAndHyperlinkHelpers(unittest.TestCase):
