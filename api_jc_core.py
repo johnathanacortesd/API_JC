@@ -40,17 +40,20 @@ CHAT_BATCH_SIZE = 30
 CHAT_PARALLEL_BATCHES = 4
 REQUEST_TIMEOUT_S = 25
 MAX_RETRIES = 2
-MAX_BUCKET = 80
-MAX_PAIRS_TOTAL = 40000
+MAX_BUCKET = 48
+MAX_EXACT_BUCKET = 20
+MAX_PAIRS_TOTAL = 12000
 MAX_CMP_CHARS = 400
 SIMILARITY_THRESHOLD_TITULOS = 0.84
 SIMILARITY_THRESHOLD_TITULOS_BCAST = 0.86
-SIMILARITY_THRESHOLD_RESUMEN = 0.86
+SIMILARITY_THRESHOLD_RESUMEN = 0.70
 SIMILARITY_THRESHOLD_SEMANTIC = 0.88
 SIMILARITY_SEMANTIC_ALONE = 0.93
 MIN_OVERLAP_GRUPO = 0.30
 JACCARD_TITULO_GRUPO = 0.70
 EMBED_CANDIDATE_MIN = 0.82
+EMBED_NEIGHBORS = 16
+CUERPO_SCAN_CHARS = 8000
 MAX_PALABRAS_SUBTEMA = 9
 MIN_PALABRAS_SUBTEMA = 3
 MAX_PALABRAS_TEMA = 5
@@ -290,6 +293,7 @@ class ProgressTracker:
 
     def __init__(self, on_stage: Optional[Callable[[Dict[str, Any]], None]] = None) -> None:
         self.t0 = time.time()
+        self._t_stage = self.t0
         self.events: List[Dict[str, Any]] = []
         self.calls = CallCounter()
         self.comparisons = ComparisonCounter()
@@ -297,16 +301,20 @@ class ProgressTracker:
         self.on_stage = on_stage
 
     def stage(self, name: str, extra: str = "") -> Dict[str, Any]:
-        elapsed = time.time() - self.t0
+        now = time.time()
+        stage_s = now - self._t_stage
+        self._t_stage = now
+        elapsed = now - self.t0
         ev = {
             "stage": name,
             "elapsed_s": round(elapsed, 3),
+            "stage_s": round(stage_s, 3),
             "chat_calls": self.calls.chat,
             "embed_calls": self.calls.embed,
             "comparisons": self.comparisons.n,
             "extra": extra,
             "label": (
-                f"{name} · {elapsed:.1f}s · "
+                f"{name} · {stage_s:.1f}s · total {elapsed:.1f}s · "
                 f"chat={self.calls.chat} · emb={self.calls.embed}"
                 + (f" · {extra}" if extra else "")
             ),
@@ -591,7 +599,11 @@ def _hay_conflicto_accion(a: str, b: str) -> bool:
 
 
 def _ratio(a: str, b: str, threshold: float = 0.0) -> float:
-    """Character SequenceMatcher for SHORT strings (titles), capped in length."""
+    """Character SequenceMatcher for SHORT strings (titles), capped in length.
+
+    Reserved for tiny n (tema consolidation) and gray-zone title pairs.
+    Never call this on resúmenes or on every grouping candidate.
+    """
     from difflib import SequenceMatcher
     if not a or not b:
         return 0.0
@@ -599,30 +611,45 @@ def _ratio(a: str, b: str, threshold: float = 0.0) -> float:
     sm = SequenceMatcher(None, a, b)
     if threshold > 0 and sm.real_quick_ratio() < threshold:
         return 0.0
+    if threshold > 0 and sm.quick_ratio() < threshold:
+        return 0.0
     return sm.ratio()
 
 
 MAX_CMP_WORDS = 80
 
 
-def _ratio_palabras(a_words: Sequence[str], b_words: Sequence[str], threshold: float = 0.0) -> float:
-    """Word-level similarity for resúmenes.
+def _jaccard_sets(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    if not inter:
+        return 0.0
+    return inter / len(a | b)
 
-    Character-level ratio() is O(len_a*len_b) and froze the UI on 1.5k-char
-    summaries. Word sequences (≤80 tokens) give the same "same text" signal
-    at ~1/100 of the cost. A set-overlap gate skips hopeless pairs first.
+
+def _overlap_sets(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
+
+
+def _ratio_palabras(a_words: Sequence[str], b_words: Sequence[str], threshold: float = 0.0) -> float:
+    """Word-set similarity for resúmenes (Jaccard / overlap).
+
+    SequenceMatcher on 80-token lists was ~1.5 ms/pair and made Agrupación
+    take several seconds on a 400-row dossier. Set overlap is the same
+    "same text" signal at microseconds.
     """
-    from difflib import SequenceMatcher
     if not a_words or not b_words:
         return 0.0
-    a_words, b_words = a_words[:MAX_CMP_WORDS], b_words[:MAX_CMP_WORDS]
-    if threshold > 0:
-        sa, sb = set(a_words), set(b_words)
-        upper = 2.0 * len(sa & sb) / max(1, len(a_words) + len(b_words))
-        # upper bound of ratio() when every shared token could align
-        if upper < threshold * 0.5:
-            return 0.0
-    return SequenceMatcher(None, a_words, b_words, autojunk=False).ratio()
+    sa, sb = set(a_words[:MAX_CMP_WORDS]), set(b_words[:MAX_CMP_WORDS])
+    jac = _jaccard_sets(sa, sb)
+    ov = _overlap_sets(sa, sb)
+    score = jac if ov < 0.90 else max(jac, ov)
+    if threshold > 0 and score < threshold * 0.45:
+        return 0.0
+    return score
 
 
 # ---------------------------------------------------------------------------
@@ -732,31 +759,43 @@ def _lista_alias(marca: str, aliases=None) -> List[str]:
     return out
 
 
-def _menciona(texto: str, marca: str, aliases=None) -> bool:
-    norm = _norm_text(texto)
-    if not norm:
-        return False
-    for nombre in _lista_alias(marca, aliases):
-        kn = _norm_text(nombre)
-        if kn and re.search(rf"(?<![a-z0-9]){re.escape(kn)}(?![a-z0-9])", norm):
-            return True
-        toks = [t for t in kn.split() if len(t) >= 3 and t not in {"de", "del", "la", "el", "los", "las", "y"}]
-        if len(toks) >= 2 and sum(t in norm.split() for t in toks) >= max(2, int(np.ceil(len(set(toks)) * 0.6))):
-            return True
-    return False
-
-
-def _ventanas_mencion(texto: str, marca: str, aliases=None, ventana: int = 220) -> List[str]:
-    if not texto:
-        return []
-    norm = _norm_text(texto)
-    hits = []
+def _compile_alias_matcher(marca: str, aliases=None) -> List[Tuple[str, str, "re.Pattern", List[str]]]:
+    compiled = []
     for nombre in _lista_alias(marca, aliases):
         kn = _norm_text(nombre)
         if not kn:
             continue
-        for m in re.finditer(rf"(?<![a-z0-9]){re.escape(kn)}(?![a-z0-9])", norm):
-            # Approximate character window back onto original text.
+        pat = re.compile(rf"(?<![a-z0-9]){re.escape(kn)}(?![a-z0-9])")
+        toks = [t for t in kn.split() if len(t) >= 3 and t not in {"de", "del", "la", "el", "los", "las", "y"}]
+        compiled.append((nombre.strip(), kn, pat, toks))
+    return compiled
+
+
+def _menciona_compiled(norm: str, compiled) -> bool:
+    if not norm or not compiled:
+        return False
+    words = None
+    for _n, _kn, pat, toks in compiled:
+        if pat.search(norm):
+            return True
+        if len(toks) >= 2:
+            if words is None:
+                words = set(norm.split())
+            if sum(t in words for t in toks) >= max(2, int(np.ceil(len(set(toks)) * 0.6))):
+                return True
+    return False
+
+
+def _menciona(texto: str, marca: str, aliases=None) -> bool:
+    return _menciona_compiled(_norm_text(texto), _compile_alias_matcher(marca, aliases))
+
+
+def _ventanas_mencion_compiled(texto: str, norm: str, compiled, ventana: int = 220) -> List[str]:
+    if not texto or not compiled:
+        return []
+    hits = []
+    for _n, _kn, pat, _toks in compiled:
+        for m in pat.finditer(norm):
             ratio = (m.start() / max(len(norm), 1))
             center = int(ratio * len(texto))
             lo, hi = max(0, center - ventana), min(len(texto), center + ventana)
@@ -766,11 +805,25 @@ def _ventanas_mencion(texto: str, marca: str, aliases=None, ventana: int = 220) 
     if hits:
         return hits
     partes = re.split(r"(?<=[\.\!\?\n])\s+", texto)
-    return [p.strip() for p in partes if p.strip() and _menciona(p, marca, aliases)]
+    out = []
+    for p in partes:
+        p = p.strip()
+        if p and _menciona_compiled(_norm_text(p), compiled):
+            out.append(p)
+    return out
+
+
+def _ventanas_mencion(texto: str, marca: str, aliases=None, ventana: int = 220) -> List[str]:
+    if not texto:
+        return []
+    return _ventanas_mencion_compiled(
+        texto, _norm_text(texto), _compile_alias_matcher(marca, aliases), ventana
+    )
 
 
 def extraer_contexto_analizado(titulo: Any, resumen: Any, marca: str,
-                               aliases=None, cuerpo: Any = "") -> Dict[str, str]:
+                               aliases=None, cuerpo: Any = "",
+                               _matcher=None) -> Dict[str, str]:
     """
     Coherent Colombian-Spanish paragraph from brand mention windows.
     Título + Resumen first; Cuerpo Completo only if needed.
@@ -779,16 +832,26 @@ def extraer_contexto_analizado(titulo: Any, resumen: Any, marca: str,
     tit = "" if titulo is None else str(titulo)
     res = "" if resumen is None else str(resumen)
     cue = "" if cuerpo is None else str(cuerpo)
-    nombres = _lista_alias(marca, aliases)
-    title_hit = _menciona(tit, marca, aliases)
-    res_hit = _menciona(res, marca, aliases)
-    cue_hit = _menciona(cue, marca, aliases) if cue else False
+    compiled = _matcher if _matcher is not None else _compile_alias_matcher(marca, aliases)
+    tit_n = _norm_text(tit)
+    res_n = _norm_text(res)
+    title_hit = _menciona_compiled(tit_n, compiled)
+    res_hit = _menciona_compiled(res_n, compiled)
+    # Cuerpo Completo is only a fallback. Scanning 410 long bodies with
+    # unidecode+regex was ~6s of the pipeline; skip it when the brand
+    # already appears in Título or Resumen.
+    cue_n = ""
+    if cue and not (title_hit or res_hit):
+        cue_n = _norm_text(cue[:CUERPO_SCAN_CHARS])
+        cue_hit = _menciona_compiled(cue_n, compiled)
+    else:
+        cue_hit = False
 
     coincidencia = ""
-    source = f"{tit} {res} {cue}"
-    source_norm = _norm_text(source)
-    for n in nombres:
-        if _norm_text(n) and re.search(rf"(?<![a-z0-9]){re.escape(_norm_text(n))}(?![a-z0-9])", source_norm):
+    for n, kn, pat, _toks in compiled:
+        if (kn and (
+            pat.search(tit_n) or pat.search(res_n) or (cue_n and pat.search(cue_n))
+        )):
             coincidencia = n
             break
     if not coincidencia and (title_hit or res_hit or cue_hit):
@@ -805,15 +868,15 @@ def extraer_contexto_analizado(titulo: Any, resumen: Any, marca: str,
 
     bloques: List[str] = []
     if title_hit or res_hit:
-        bloques.extend(_ventanas_mencion(tit, marca, aliases))
-        bloques.extend(_ventanas_mencion(res, marca, aliases))
+        bloques.extend(_ventanas_mencion_compiled(tit, tit_n, compiled))
+        bloques.extend(_ventanas_mencion_compiled(res, res_n, compiled))
         if not bloques:
             if title_hit:
                 bloques.append(tit.strip())
             if res_hit:
                 bloques.append(res.strip())
     elif cue_hit:
-        bloques.extend(_ventanas_mencion(cue, marca, aliases)[:3])
+        bloques.extend(_ventanas_mencion_compiled(cue[:CUERPO_SCAN_CHARS], cue_n, compiled)[:3])
     else:
         if res.strip():
             bloques.append(res.strip())
@@ -882,12 +945,12 @@ def _candidate_pairs(n: int, buckets: Dict[str, List[int]],
                      ) -> List[Tuple[int, int]]:
     """Blocked candidate generation (Python-level work stays << n²).
 
-    - Exact buckets (title prefix, resumen prefix, URL, date+time) are
-      never skipped: identical headlines must always meet.
+    - Exact buckets (title prefix, resumen prefix, URL) always meet.
+      Date+time buckets are capped: same hour alone is too coarse.
     - Token buckets: pairs sharing ≥2 distinctive tokens, or 1 rare token
       (df ≤ 6), via posting-list co-occurrence counts.
-    - Embedding neighbours: one vectorised matrix product; pairs with
-      cosine ≥ EMBED_CANDIDATE_MIN join the candidate set.
+    - Embedding neighbours: top-K per row from one matrix product, not
+      every pair above a cosine floor (that exploded to ~8k pairs).
     """
     pares = set()
     for key, idxs in buckets.items():
@@ -896,6 +959,10 @@ def _candidate_pairs(n: int, buckets: Dict[str, List[int]],
         if key.startswith("k:"):
             continue
         orden = sorted(set(idxs))
+        if key.startswith("d:") and len(orden) > MAX_EXACT_BUCKET:
+            continue
+        if len(orden) > MAX_BUCKET:
+            orden = orden[:MAX_BUCKET]
         for a in range(len(orden)):
             for b in range(a + 1, len(orden)):
                 pares.add((orden[a], orden[b]))
@@ -926,16 +993,21 @@ def _candidate_pairs(n: int, buckets: Dict[str, List[int]],
 
     if unit_matrix is not None and len(unit_matrix) >= 2 and len(pares) < MAX_PAIRS_TOTAL:
         M = unit_matrix
-        step = 512
-        for s in range(0, len(M), step):
-            block = M[s:s + step] @ M.T
-            ii, jj = np.nonzero(block >= EMBED_CANDIDATE_MIN)
-            for a, b in zip(ii.tolist(), jj.tolist()):
-                i, j = s + a, b
+        k = min(EMBED_NEIGHBORS, len(M) - 1)
+        if k >= 1:
+            sims = M @ M.T
+            np.fill_diagonal(sims, -2.0)
+            # argpartition is O(n) per row; full argsort was wasteful.
+            neigh = np.argpartition(-sims, kth=k - 1, axis=1)[:, :k]
+            rows = np.arange(len(M))[:, None]
+            mask = sims[rows, neigh] >= EMBED_CANDIDATE_MIN
+            ii = np.repeat(np.arange(len(M)), k)[mask.ravel()]
+            jj = neigh.ravel()[mask.ravel()]
+            for i, j in zip(ii.tolist(), jj.tolist()):
                 if i < j:
                     pares.add((i, j))
-            if len(pares) >= MAX_PAIRS_TOTAL:
-                break
+                if len(pares) >= MAX_PAIRS_TOTAL:
+                    break
 
     if counter:
         counter.add(len(pares))
@@ -964,8 +1036,8 @@ def agrupar_noticias_bloqueado(
     ctx_n = [_norm_text(c) for c in (contextos or [""] * n)]
     url_n = [normalize_url(u) for u in (urls or [""] * n)]
 
-    # Per-row precomputation: tokens are built once, not once per pair.
-    res_words = [r.split()[:MAX_CMP_WORDS] for r in res_n]
+    # Per-row precomputation: tokens/sets built once, not once per pair.
+    res_sets = [set(r.split()[:MAX_CMP_WORDS]) for r in res_n]
     res_pref = [_prefix(r, 10) for r in res_n]
     texto_row = [" ".join(x for x in (tit_n[i], res_n[i], ctx_n[i]) if x) for i in range(n)]
     tok_conf = [_tokens_distintivos(texto_row[i], min_len=3) for i in range(n)]
@@ -979,6 +1051,18 @@ def agrupar_noticias_bloqueado(
         extra = [t for t in (res_n[i] or ctx_n[i]).split() if len(t) >= 5 and t not in _TOKENS_DEBILES]
         s.update(_stems(extra[:10]))
         tok_block.append(s)
+
+    # Bitmask of opposite-action tokens so the pair loop is a few AND tests.
+    action_bits = [0] * n
+    for i in range(n):
+        bits = 0
+        for k, (ga, gb) in enumerate(_ACCIONES_OPUESTAS):
+            if tok_conf[i] & ga:
+                bits |= 1 << (2 * k)
+            if tok_conf[i] & gb:
+                bits |= 1 << (2 * k + 1)
+        action_bits[i] = bits
+    opp_pairs = [(1 << (2 * k), 1 << (2 * k + 1)) for k in range(len(_ACCIONES_OPUESTAS))]
 
     buckets: Dict[str, List[int]] = defaultdict(list)
     for i in range(n):
@@ -996,77 +1080,77 @@ def agrupar_noticias_bloqueado(
                 buckets[f"d:{fh}"].append(i)
 
     embs = list(embeddings) if embeddings is not None else [None] * n
-    # Unit-normalize once; per-pair sklearn cosine_similarity cost ~3ms each
-    # (≈30s for 9k pairs). A dot product of unit vectors is the same number.
-    unit = [None] * n
+    unit_matrix = None
     dim = None
+    present = []
     for k, e in enumerate(embs):
         if e is None:
             continue
-        v = np.asarray(e, dtype=float).ravel()
-        nrm = np.linalg.norm(v)
+        v = np.asarray(e, dtype=np.float32).ravel()
+        nrm = float(np.linalg.norm(v))
         if nrm > 0:
-            unit[k] = v / nrm
+            present.append((k, v / nrm))
             dim = len(v)
-    unit_matrix = None
     if dim is not None:
-        unit_matrix = np.zeros((n, dim), dtype=float)
-        for k, u in enumerate(unit):
-            if u is not None and len(u) == dim:
+        unit_matrix = np.zeros((n, dim), dtype=np.float32)
+        for k, u in present:
+            if len(u) == dim:
                 unit_matrix[k] = u
-    can_cos = True
 
     pares = _candidate_pairs(n, buckets, counter, token_sets=tok_block, unit_matrix=unit_matrix)
 
-    def _jaccard_titulo(i: int, j: int) -> float:
-        a, b = tok_tit[i], tok_tit[j]
-        if not a or not b:
-            return 0.0
-        return len(a & b) / max(1, len(a | b))
+    sem_all = None
+    if unit_matrix is not None and pares:
+        I = np.fromiter((p[0] for p in pares), dtype=np.intp, count=len(pares))
+        J = np.fromiter((p[1] for p in pares), dtype=np.intp, count=len(pares))
+        sem_all = np.einsum("ij,ij->i", unit_matrix[I], unit_matrix[J])
 
     def _contenido(i: int, j: int) -> bool:
         a, b = tit_n[i], tit_n[j]
         return bool(a and b and min(len(a), len(b)) >= 25 and (a in b or b in a))
 
     def _conflicto(i: int, j: int) -> bool:
-        ta, tb = tok_conf[i], tok_conf[j]
-        for ga, gb in _ACCIONES_OPUESTAS:
-            if (ta & ga and tb & gb) or (ta & gb and tb & ga):
+        a, b = action_bits[i], action_bits[j]
+        for ga, gb in opp_pairs:
+            if (a & ga and b & gb) or (a & gb and b & ga):
                 return True
         return False
 
-    def _overlap(i: int, j: int) -> float:
-        ta, tb = tok_ov[i], tok_ov[j]
-        if not ta or not tb:
-            return 0.0
-        return len(ta & tb) / max(1, min(len(ta), len(tb)))
-
-    for i, j in pares:
+    for k, (i, j) in enumerate(pares):
         if _conflicto(i, j):
             continue
-        sim_t = _ratio(tit_n[i], tit_n[j], SIMILARITY_THRESHOLD_TITULOS) if tit_n[i] and tit_n[j] else 0.0
-        sim_r = _ratio_palabras(res_words[i], res_words[j], SIMILARITY_THRESHOLD_RESUMEN)
-        if sim_r < SIMILARITY_THRESHOLD_RESUMEN and res_pref[i] and res_pref[i] == res_pref[j]:
-            # identical opening sentence still counts as the same resumen
-            sim_r = max(sim_r, 0.90)
-        semantic = 0.0
-        if can_cos and unit[i] is not None and unit[j] is not None:
-            semantic = float(np.dot(unit[i], unit[j]))
-        overlap = _overlap(i, j)
+        semantic = float(sem_all[k]) if sem_all is not None else 0.0
         same_url = bool(url_n[i] and url_n[i] == url_n[j])
-        jac_t = _jaccard_titulo(i, j)
-        shared_t = len(tok_tit[i] & tok_tit[j])
+        inter_t = tok_tit[i] & tok_tit[j]
+        shared_t = len(inter_t)
+        jac_t = (shared_t / len(tok_tit[i] | tok_tit[j])) if (tok_tit[i] and tok_tit[j] and shared_t) else 0.0
+        overlap = _overlap_sets(tok_ov[i], tok_ov[j])
+        jac_r = _jaccard_sets(res_sets[i], res_sets[j])
+        ov_r = _overlap_sets(res_sets[i], res_sets[j])
+        sim_r = jac_r if ov_r < 0.90 else max(jac_r, ov_r)
+        if sim_r < SIMILARITY_THRESHOLD_RESUMEN and res_pref[i] and res_pref[i] == res_pref[j]:
+            sim_r = max(sim_r, 0.90)
         mismo_hecho = (
-            sim_t >= SIMILARITY_THRESHOLD_TITULOS
+            same_url
             or _contenido(i, j)
             or (jac_t >= JACCARD_TITULO_GRUPO and shared_t >= 4)
             or (jac_t >= 0.80 and shared_t >= 3)
             or (jac_t >= 0.50 and shared_t >= 3 and semantic >= 0.82)
             or sim_r >= SIMILARITY_THRESHOLD_RESUMEN
-            or same_url
             or semantic >= SIMILARITY_SEMANTIC_ALONE
             or (semantic >= SIMILARITY_THRESHOLD_SEMANTIC and overlap >= MIN_OVERLAP_GRUPO)
         )
+        # Gray zone only: near-paraphrase titles that set metrics miss.
+        # SequenceMatcher stays off the common path (was ~1.5 ms × 8k pairs).
+        if (
+            not mismo_hecho
+            and tit_n[i] and tit_n[j]
+            and shared_t >= 2
+            and semantic >= 0.75
+            and jac_t >= 0.30
+        ):
+            if _ratio(tit_n[i], tit_n[j], SIMILARITY_THRESHOLD_TITULOS) >= SIMILARITY_THRESHOLD_TITULOS:
+                mismo_hecho = True
         if mismo_hecho:
             dsu.union(i, j)
     return dsu.grupos(n)
@@ -1762,9 +1846,11 @@ def process_pipeline(
         resumenes.append(r.get(km["resumen"], ""))
         cuerpos.append(r.get(km.get("cuerpo", "Cuerpo Completo"), ""))
 
+    matcher = _compile_alias_matcher(marca, aliases)
     for i, r in enumerate(out):
         meta = extraer_contexto_analizado(
-            titulos[i], resumenes[i], marca, aliases, cuerpos[i]
+            titulos[i], resumenes[i], marca, aliases, cuerpos[i],
+            _matcher=matcher,
         )
         r["Contexto analizado"] = meta["contexto"]
         r["Coincidencia marca"] = meta["coincidencia"]

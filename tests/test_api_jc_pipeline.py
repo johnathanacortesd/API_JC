@@ -368,6 +368,11 @@ class TestScaleAndBatching(unittest.TestCase):
         max_pairs = n * (n - 1) // 2
         self.assertLess(prog.comparisons.n, n * 40)
         self.assertLess(prog.comparisons.n, max_pairs // 4)
+        agr = next(e for e in prog.events if e["stage"] == "Agrupación")
+        ctx = next(e for e in prog.events if e["stage"] == "Contexto")
+        self.assertLess(agr["stage_s"], 1.5, f"Agrupación itself too slow: {agr['stage_s']:.2f}s")
+        self.assertLess(ctx["stage_s"], 2.0, f"Contexto itself too slow: {ctx['stage_s']:.2f}s")
+        self.assertIn("total", agr["label"])
         # Valid model output ⇒ one batched pass, no repair round.
         self.assertLessEqual(len(chat_calls), (n + core.CHAT_BATCH_SIZE - 1) // core.CHAT_BATCH_SIZE + 1)
         self.assertGreaterEqual(len(chat_calls), 1)
@@ -384,6 +389,67 @@ class TestScaleAndBatching(unittest.TestCase):
         for required in ("Limpieza", "Duplicados", "Contexto", "Embedding único",
                          "Agrupación", "Tono", "Tema/Subtema"):
             self.assertIn(required, stages)
+
+
+class TestGroupingSpeedRealistic(unittest.TestCase):
+    def test_11_agrupacion_410_clustered_under_one_second(self):
+        """Reproduce the 410-row Streamlit dossier: long resúmenes, clustered
+        embeddings, shared dates. Agrupación must stay well under a second.
+        """
+        n = 410
+        rnd = __import__("random").Random(3)
+        rng = __import__("numpy").random.RandomState(3)
+        vocab = ("terremoto cali colombia sismo victimas heridos autoridades alcaldia "
+                 "rescate solidaridad balance emergencia ciudad barrio vivienda familias "
+                 "damnificados bomberos gobierno informe cifras reporte topos azteca").split()
+        titulos, resumenes, contextos, urls, fechas, horas = [], [], [], [], [], []
+        clusters = [rng.randn(32).astype("float32") for _ in range(40)]
+        embeddings = []
+        for i in range(n):
+            titulos.append(f"Sismo en Cali: {rnd.choice(vocab)} {rnd.choice(vocab)} {i}")
+            resumenes.append(" ".join(rnd.choice(vocab) for _ in range(220)) + f" ZX{i:04d}.")
+            contextos.append(resumenes[-1][:400])
+            urls.append(f"https://noticias.example/{i}/nota-{i}")
+            fechas.append("2026-04-01")
+            horas.append(f"{(i % 18) + 6:02d}:00")
+            embeddings.append(clusters[i % 40] + 0.08 * rng.randn(32).astype("float32"))
+        # Known same-fact pair (paraphrased titles + similar resumen).
+        titulos[10] = "Topos Azteca destacan la solidaridad de los caleños durante las labores de rescate"
+        titulos[11] = "Los Topos Azteca destacaron la solidaridad de los caleños en el rescate"
+        resumenes[10] = resumenes[11] = (
+            "Las autoridades confirmaron el aumento de heridos tras el terremoto andino."
+        )
+        embeddings[11] = embeddings[10]
+
+        t0 = time.time()
+        grupos = core.agrupar_noticias_bloqueado(
+            titulos, resumenes, contextos, embeddings, urls, fechas, horas,
+            counter=core.ComparisonCounter(),
+        )
+        dt = time.time() - t0
+        self.assertLess(dt, 1.0, f"agrupar_noticias_bloqueado took {dt:.2f}s")
+        by_row = {}
+        for g, idxs in grupos.items():
+            for i in idxs:
+                by_row[i] = g
+        self.assertEqual(by_row[10], by_row[11])
+        self.assertGreaterEqual(len(grupos), 40, "must not collapse the whole dossier into few groups")
+
+    def test_12_contexto_skips_cuerpo_when_title_hits(self):
+        cuerpo = ("palabra " * 4000) + "Relleno sin marca en el cuerpo largo."
+        t0 = time.time()
+        for _ in range(80):
+            meta = core.extraer_contexto_analizado(
+                "Topos Azteca destacan la solidaridad",
+                "Resumen corto de la nota.",
+                "Topos Azteca",
+                ["Topos"],
+                cuerpo,
+            )
+        dt = time.time() - t0
+        self.assertLess(dt, 1.2, f"contexto with long cuerpo too slow: {dt:.2f}s")
+        self.assertIn("Topos", meta["contexto"])
+        self.assertEqual(meta["origen"], "Título")
 
 
 class TestUrlAndHyperlinkHelpers(unittest.TestCase):
